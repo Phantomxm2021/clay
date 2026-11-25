@@ -1,0 +1,89 @@
+# syntax=docker/dockerfile:1
+FROM ubuntu:22.04
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates gcc libc6-dev linux-libc-dev python3-pip \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m pip install --no-cache-dir 'runpod==1.8.1'
+
+COPY <<'PY' /app/stage_glibc.py
+import hashlib
+import subprocess
+import tempfile
+from pathlib import Path
+
+import runpod
+
+VOLUME = Path("/runpod-volume")
+ROOT = VOLUME / "clay" / "trellis2-cache" / "ubuntu-jammy-amd64-glibc-dev"
+INCLUDE = Path("/usr/include")
+LIB = Path("/usr/lib/x86_64-linux-gnu")
+NEEDED_LIBS = ("crti.o", "crtn.o", "libc.so", "libc_nonshared.a")
+
+
+def stage_file(source, destination):
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    expected = source.read_bytes()
+    if source == LIB / "libc.so":
+        path = str(LIB / "libc_nonshared.a").encode()
+        replacement = str(ROOT / "lib" / "libc_nonshared.a").encode()
+        if path not in expected:
+            raise RuntimeError("Unexpected Ubuntu libc linker file")
+        expected = expected.replace(path, replacement)
+    if destination.exists() and destination.read_bytes() == expected:
+        return len(expected)
+    with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as temporary:
+        temporary.write(expected)
+    temporary_path = Path(temporary.name)
+    try:
+        if hashlib.sha256(temporary_path.read_bytes()).digest() != hashlib.sha256(expected).digest():
+            raise RuntimeError(f"Could not verify {destination.name} on the volume")
+        temporary_path.replace(destination)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return len(expected)
+
+
+def handler(job):
+    if job.get("input") != {"operation": "stage_clay_glibc_headers"}:
+        return {"error": "Expected stage_clay_glibc_headers operation"}
+    if not VOLUME.is_mount():
+        raise RuntimeError("The approved Global Volume is not mounted")
+    if subprocess.check_output(["dpkg", "--print-architecture"], text=True).strip() != "amd64":
+        raise RuntimeError("The worker image must use Ubuntu amd64")
+
+    files = {
+        Path(name)
+        for name in subprocess.check_output(
+            ["dpkg", "-L", "libc6-dev", "linux-libc-dev"], text=True
+        ).splitlines()
+        if name.startswith("/usr/include/") and Path(name).is_file()
+    }
+    count = 0
+    size = 0
+    for path in sorted(files):
+        size += stage_file(path, ROOT / "include" / path.relative_to(INCLUDE))
+        count += 1
+    for name in NEEDED_LIBS:
+        size += stage_file(LIB / name, ROOT / "lib" / name)
+        count += 1
+
+    base_include = subprocess.check_output(["gcc", "-print-file-name=include"], text=True).strip()
+    with tempfile.TemporaryDirectory(prefix="clay-glibc-check-") as scratch:
+        test = Path(scratch) / "check.c"
+        test.write_text("#include <stdlib.h>\n#include <linux/types.h>\nvoid *check(void) { return malloc(10); }\n")
+        subprocess.run(
+            ["gcc", "-nostdinc", "-isystem", base_include,
+             "-isystem", str(ROOT / "include" / "x86_64-linux-gnu"),
+             "-isystem", str(ROOT / "include"),
+             "-shared", "-fPIC", "-Wl,-z,defs", "-L", str(ROOT / "lib"),
+             str(test), "-o", str(Path(scratch) / "check.so")],
+            check=True,
+        )
+    return {"status": "ready", "files": count, "bytes": size}
+
+
+runpod.serverless.start({"handler": handler})
+PY
+
+CMD ["python3", "-u", "/app/stage_glibc.py"]
