@@ -34,23 +34,20 @@ def fixed_birefnet(source):
     return result
 
 
-def link_weight(source, target):
+def copy_weight(source, target):
     size = source.stat().st_size
-    if target.exists() and target.stat().st_size == size:
-        return
+    if size <= 0:
+        raise RuntimeError(f"Original checkpoint is empty: {source.name}")
+    if target.is_file() and not target.is_symlink() and target.stat().st_size == size:
+        return size
     target.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=target.parent) as scratch:
         entry = Path(scratch) / target.name
-        try:
-            entry.symlink_to(source)
-            if entry.stat().st_size != size:
-                raise OSError("The volume did not resolve the symlink")
-        except OSError:
-            entry.unlink(missing_ok=True)
-            shutil.copyfile(source, entry)
+        shutil.copyfile(source, entry)
         entry.replace(target)
-    if not target.is_file() or target.stat().st_size != size:
+    if not target.is_file() or target.is_symlink() or target.stat().st_size != size:
         raise RuntimeError(f"Cached file is incomplete: {target.name}")
+    return size
 
 
 def handler(job):
@@ -62,11 +59,12 @@ def handler(job):
     compat = ROOT / "compat-hub"
     patch_path = BIREFNET / "birefnet.py"
     patch = fixed_birefnet((original / patch_path).read_text())
+    total = 0
     for filename in ("config.json", "BiRefNet_config.py", "model.safetensors"):
-        link_weight(original / BIREFNET / filename, compat / BIREFNET / filename)
+        total += copy_weight(original / BIREFNET / filename, compat / BIREFNET / filename)
     for suffix in (".json", ".safetensors"):
         name = SPARSE / "ckpts" / f"ss_dec_conv3d_16l8_fp16{suffix}"
-        link_weight(original / name, compat / name)
+        total += copy_weight(original / name, compat / name)
     fixed = compat / patch_path
     with tempfile.NamedTemporaryFile("w", dir=fixed.parent, delete=False) as out:
         out.write(patch)
@@ -77,7 +75,7 @@ def handler(job):
         temporary.unlink(missing_ok=True)
     if fixed.read_text() != patch:
         raise RuntimeError("The patched file did not persist to the volume")
-    return {"status": "ready", "checkpoint_linked": (compat / BIREFNET / "model.safetensors").is_symlink()}
+    return {"status": "ready", "checkpoint_bytes": total}
 
 
 runpod.serverless.start({"handler": handler})
