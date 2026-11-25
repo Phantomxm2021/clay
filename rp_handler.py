@@ -122,6 +122,9 @@ def handler(job):
     except ValueError as exc:
         return {"error": str(exc)}
 
+    if mode == "text" and os.environ.get("CLAY_TRELLIS2_IMAGE_ONLY") == "1":
+        return {"error": "This Clay endpoint accepts image requests"}
+
     if os.environ.get("CLAY_IMAGE_BACKEND") == "sprint3d":
         from rp_process import generate
 

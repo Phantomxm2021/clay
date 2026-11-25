@@ -1,21 +1,96 @@
 """GPU inference process for the RunPod queue worker."""
 
 import base64
+import faulthandler
 import json
 import os
+import shutil
 import struct
 import sys
 import tempfile
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
+from unittest.mock import patch
 
 TRELLIS2_SOURCE = "/opt/TRELLIS.2"
 TRELLIS2_REPO = "microsoft/TRELLIS.2-4B"
 TRELLIS2_REVISION = "af44b45f2e35a493886929c6d786e563ec68364d"
 DINO_REPO = "facebook/dinov3-vitl16-pretrain-lvd1689m"
+DINO_REVISION = "ea8dc2863c51be0a264bab82070e3e8836b02d51"
+BIREFNET_REPO = "ZhengPeng7/BiRefNet"
 BIREFNET_REVISION = "66f7f80c1a64b3c4df327a07eeca4e87130b787b"
+SPARSE_REPO = "microsoft/TRELLIS-image-large"
+SPARSE_REVISION = "25e0d31ffbebe4b5a97464dd851910efc3002d96"
+SPARSE_CHECKPOINT = "ckpts/ss_dec_conv3d_16l8_fp16"
+SNAPSHOT_FILES = {
+    DINO_REPO: ("config.json", "model.safetensors", "preprocessor_config.json"),
+    BIREFNET_REPO: ("config.json", "model.safetensors", "BiRefNet_config.py", "birefnet.py"),
+}
+
+
+@contextmanager
+def _stage(name):
+    started = time.perf_counter()
+    print(f"Clay TRELLIS.2 {name} started", file=sys.stderr, flush=True)
+    try:
+        yield
+    except BaseException:
+        print(f"Clay TRELLIS.2 {name} failed after {time.perf_counter() - started:.2f}s",
+              file=sys.stderr, flush=True)
+        raise
+    else:
+        print(f"Clay TRELLIS.2 {name} completed in {time.perf_counter() - started:.2f}s",
+              file=sys.stderr, flush=True)
+
+
+def _snapshot(cache, repo, revision):
+    return cache / ("models--" + repo.replace("/", "--")) / "snapshots" / revision
+
+
+def _stage_cached_weights(work_dir, weights):
+    """Read the pinned files sequentially into worker-local storage before mmap."""
+    cache = Path(os.environ["HF_HUB_CACHE"])
+    dino = Path(os.environ.get("CLAY_DINOV3_PATH") or _snapshot(cache, DINO_REPO, DINO_REVISION))
+    birefnet = _snapshot(cache, BIREFNET_REPO, BIREFNET_REVISION)
+    sparse = _snapshot(cache, SPARSE_REPO, SPARSE_REVISION)
+    config = json.loads((weights / "pipeline.json").read_text())
+    args = config["args"]
+    copies = []
+    for key, checkpoint in args["models"].items():
+        if checkpoint == f"{SPARSE_REPO}/{SPARSE_CHECKPOINT}":
+            source = sparse / SPARSE_CHECKPOINT
+            args["models"][key] = SPARSE_CHECKPOINT
+        elif Path(checkpoint).parent == Path("ckpts"):
+            source = weights / checkpoint
+        else:
+            raise RuntimeError(f"Unexpected TRELLIS.2 checkpoint: {checkpoint}")
+        copies.extend((Path(f"{source}{ext}"), work_dir / f"{args['models'][key]}{ext}")
+                      for ext in (".json", ".safetensors"))
+    for repo, source, target in ((DINO_REPO, dino, "dinov3"), (BIREFNET_REPO, birefnet, "birefnet")):
+        copies.extend((source / name, work_dir / target / name) for name in SNAPSHOT_FILES[repo])
+    total = sum(source.stat().st_size for source, _ in copies)
+    if shutil.disk_usage(work_dir).free < total + 2 * 1024**3:
+        raise RuntimeError(f"Insufficient worker-local disk to stage {total / 1e9:.2f} GB of weights")
+
+    def copy(entry):
+        source, destination = entry
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with _stage(f"copy {destination.relative_to(work_dir)} ({source.stat().st_size / 1e6:.1f} MB)"):
+            shutil.copyfile(source, destination)
+            if destination.stat().st_size != source.stat().st_size:
+                raise RuntimeError(f"Incomplete local checkpoint copy: {destination.name}")
+
+    # Two large sequential reads keep the network mount busy without opening every shard at once.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(copy, sorted(copies, key=lambda item: item[0].stat().st_size, reverse=True)))
+    args["image_cond_model"]["args"]["model_name"] = str(work_dir / "dinov3")
+    args["rembg_model"]["args"]["model_name"] = str(work_dir / "birefnet")
+    args["low_vram"] = True
+    (work_dir / "pipeline.json").write_text(json.dumps(config))
 
 
 def require_pbr(mesh):
@@ -36,6 +111,11 @@ def require_pbr(mesh):
 
 
 def _prepare_weights(work_dir):
+    configured = os.environ.get("CLAY_TRELLIS2_WEIGHTS")
+    if configured and os.environ.get("HF_HUB_CACHE"):
+        _stage_cached_weights(work_dir, Path(configured))
+        return
+
     from huggingface_hub import snapshot_download
     from huggingface_hub.errors import GatedRepoError
 
@@ -58,7 +138,7 @@ def _prepare_weights(work_dir):
     args = config["args"]
     args["image_cond_model"]["args"]["model_name"] = str(dino_path)
     args["rembg_model"]["args"]["model_name"] = snapshot_download(
-        "ZhengPeng7/BiRefNet", revision=BIREFNET_REVISION,
+        BIREFNET_REPO, revision=BIREFNET_REVISION,
         allow_patterns=["*.json", "*.py", "*.safetensors"],
     )
     args["low_vram"] = True
@@ -69,12 +149,20 @@ def _prepare_weights(work_dir):
 @lru_cache(maxsize=1)
 def _load_trellis2():
     from baseline_io import configure_process
-    configure_process()
-    from mesh_path import Trellis2MeshPath
+    offline = bool(os.environ.get("CLAY_TRELLIS2_WEIGHTS") and os.environ.get("HF_HUB_CACHE"))
+    configure_process(threads=min(8, len(os.sched_getaffinity(0))), offline=offline)
+    with _stage("import model runtime"):
+        from mesh_path import Trellis2MeshPath
 
     work_dir = tempfile.TemporaryDirectory(prefix="clay-trellis2-")
+    faulthandler.dump_traceback_later(90, repeat=True)
     try:
-        _prepare_weights(Path(work_dir.name))
+        with _stage("prepare weights"):
+            _prepare_weights(Path(work_dir.name))
+
+        disable = ["mesh_prep_worker_thread"]
+        if os.environ.get("CLAY_TRELLIS2_STOCK_NATIVE") == "1":
+            disable.extend(("fast_gpu_simplify", "gpu_bvh_build"))
 
         class ClayMeshPath(Trellis2MeshPath):
             def _gpu_phase(self, mesh, resolution, divisor, timings):
@@ -83,20 +171,30 @@ def _load_trellis2():
                 return bake.geometry_gpu_phase(
                     mesh.vertices, mesh.faces, int(resolution), self.target_tris, self.texture_size,
                     mesh_module=self.mesh_module, bvh_cls=self.bvh_cls, remesh_divisor=divisor,
-                    fast_simplify=True, gpu_charts=True, timings=timings,
+                    fast_simplify="fast_gpu_simplify" in self.levers, gpu_charts=True, timings=timings,
                 )
 
         method = ClayMeshPath(
-            arm="mesh_path", disable=("mesh_prep_worker_thread",), source=TRELLIS2_SOURCE,
+            arm="mesh_path", disable=disable, source=TRELLIS2_SOURCE,
             weights=work_dir.name, record_latents=False, keep_models_on_gpu=False,
         )
-        started = time.perf_counter()
-        method.load()
-        print(f"TRELLIS.2 models loaded in {time.perf_counter() - started:.2f}s", file=sys.stderr)
+        with _stage("initialize model and GPU extensions"):
+            from trellis2 import models
+
+            load_checkpoint = models.from_pretrained
+
+            def load_timed(path, **kwargs):
+                with _stage(f"load {Path(path).name}"):
+                    return load_checkpoint(path, **kwargs)
+
+            with patch.object(models, "from_pretrained", load_timed):
+                method.load()
         return method, work_dir
     except BaseException:
         work_dir.cleanup()
         raise
+    finally:
+        faulthandler.cancel_dump_traceback_later()
 
 
 def _trellis2_image(request, output):
@@ -116,7 +214,8 @@ def _trellis2_image(request, output):
     torch.cuda.reset_peak_memory_stats()
     stages = Stages()
     started = time.perf_counter()
-    stats = method.run(str(image), output.parent, request["seed"], stages)
+    with _stage("generate mesh and bake PBR maps"):
+        stats = method.run(str(image), output.parent, request["seed"], stages)
     torch.cuda.synchronize()
     metrics = {
         "model_load_s": round(load_s, 3),
