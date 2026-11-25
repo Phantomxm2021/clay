@@ -2,6 +2,7 @@
 
 import base64
 import faulthandler
+import io
 import json
 import os
 import shutil
@@ -51,6 +52,18 @@ def _snapshot(cache, repo, revision):
     return cache / ("models--" + repo.replace("/", "--")) / "snapshots" / revision
 
 
+def _patch_birefnet_config(path):
+    source = path.read_text()
+    config_init = "class Config(PretrainedConfig):\n    def __init__(self) -> None:\n"
+    compatible_init = config_init + "        super().__init__()\n"
+    if compatible_init in source:
+        return
+    if source.count(config_init) != 1:
+        raise RuntimeError("Pinned BiRefNet config has an unexpected structure")
+    # Match the upstream compatibility fix for Transformers 4.56 and later.
+    path.write_text(source.replace(config_init, compatible_init, 1))
+
+
 def _stage_cached_weights(work_dir, weights):
     """Read the pinned files sequentially into worker-local storage before mmap."""
     cache = Path(os.environ["HF_HUB_CACHE"])
@@ -72,7 +85,12 @@ def _stage_cached_weights(work_dir, weights):
                       for ext in (".json", ".safetensors"))
     for repo, source, target in ((DINO_REPO, dino, "dinov3"), (BIREFNET_REPO, birefnet, "birefnet")):
         copies.extend((source / name, work_dir / target / name) for name in SNAPSHOT_FILES[repo])
-    total = sum(source.stat().st_size for source, _ in copies)
+    total = 0
+    for source, _ in copies:
+        size = source.stat().st_size
+        if size <= 0:
+            raise RuntimeError(f"Missing checkpoint contents: {source.name}")
+        total += size
     if shutil.disk_usage(work_dir).free < total + 2 * 1024**3:
         raise RuntimeError(f"Insufficient worker-local disk to stage {total / 1e9:.2f} GB of weights")
 
@@ -87,6 +105,7 @@ def _stage_cached_weights(work_dir, weights):
     # Two large sequential reads keep the network mount busy without opening every shard at once.
     with ThreadPoolExecutor(max_workers=2) as pool:
         list(pool.map(copy, sorted(copies, key=lambda item: item[0].stat().st_size, reverse=True)))
+    _patch_birefnet_config(work_dir / "birefnet" / "birefnet.py")
     args["image_cond_model"]["args"]["model_name"] = str(work_dir / "dinov3")
     args["rembg_model"]["args"]["model_name"] = str(work_dir / "birefnet")
     args["low_vram"] = True
@@ -95,10 +114,17 @@ def _stage_cached_weights(work_dir, weights):
 
 def require_pbr(mesh):
     """Verify that the GLB actually references embedded PBR textures and normals."""
+    from PIL import Image
+
     magic, version, size, length, kind = struct.unpack_from("<4sIII4s", mesh)
     if (magic, version, size, kind) != (b"glTF", 2, len(mesh), b"JSON"):
         raise RuntimeError("Invalid TRELLIS.2 GLB header")
     doc = json.loads(mesh[20:20 + length])
+    binary_length, binary_tag = struct.unpack_from("<I4s", mesh, 20 + length)
+    binary_start = 28 + length
+    if binary_tag != b"BIN\x00" or binary_start + binary_length != len(mesh):
+        raise RuntimeError("Invalid TRELLIS.2 GLB binary section")
+    checked_images = set()
     for item in doc["meshes"]:
         for primitive in item["primitives"]:
             material = doc["materials"][primitive["material"]]["pbrMetallicRoughness"]
@@ -106,8 +132,22 @@ def require_pbr(mesh):
                 raise RuntimeError("TRELLIS.2 exported a mesh without normals or UVs")
             for channel in ("baseColorTexture", "metallicRoughnessTexture"):
                 texture = doc["textures"][material[channel]["index"]]
-                if "bufferView" not in doc["images"][texture["source"]]:
+                source = texture["source"]
+                image = doc["images"][source]
+                if "bufferView" not in image or image.get("mimeType") != "image/png":
                     raise RuntimeError(f"TRELLIS.2 did not embed {channel}")
+                if source in checked_images:
+                    continue
+                view = doc["bufferViews"][image["bufferView"]]
+                offset = view.get("byteOffset", 0)
+                end = offset + view["byteLength"]
+                if view["buffer"] != 0 or not 0 <= offset < end <= binary_length:
+                    raise RuntimeError(f"TRELLIS.2 exported an invalid {channel} image range")
+                with Image.open(io.BytesIO(mesh[binary_start + offset:binary_start + end]), formats=["PNG"]) as png:
+                    if png.mode not in ("RGB", "RGBA"):
+                        raise RuntimeError(f"TRELLIS.2 exported an unsupported {channel} image mode")
+                    png.verify()
+                checked_images.add(source)
 
 
 def _prepare_weights(work_dir):
@@ -154,7 +194,7 @@ def _load_trellis2():
     with _stage("import model runtime"):
         from mesh_path import Trellis2MeshPath
 
-    work_dir = tempfile.TemporaryDirectory(prefix="clay-trellis2-")
+    work_dir = tempfile.TemporaryDirectory(prefix="clay-trellis2-", dir=os.environ.get("CLAY_MODEL_SCRATCH"))
     faulthandler.dump_traceback_later(90, repeat=True)
     try:
         with _stage("prepare weights"):
