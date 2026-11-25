@@ -128,7 +128,7 @@ RUN python -m pip install --no-cache-dir \
 FROM nvidia/cuda:12.8.1-runtime-ubuntu22.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates gcc libegl1 libgl1 libgles2 libglib2.0-0 libgomp1 libusb-1.0-0 \
+    ca-certificates gcc libc6-dev libegl1 libgl1 libgles2 libglib2.0-0 libgomp1 libusb-1.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 ENV ATTN_BACKEND=xformers \
@@ -152,6 +152,10 @@ WORKDIR /app
 COPY src /app/src
 COPY rp_handler.py rp_process.py rp_inference.py /app/
 RUN python -c 'import torch; import trellis.pipelines, trellis.utils.postprocessing_utils, rp_handler; assert "error" in rp_handler.handler({"input": {}})' \
-    && /opt/trellis2-venv/bin/python -c 'import torch, flash_attn; assert torch.version.cuda == "12.8"'
+    && /opt/trellis2-venv/bin/python -c 'import torch, flash_attn; assert torch.version.cuda == "12.8"' \
+    && TRITON_DRIVER=/opt/trellis2-venv/lib/python3.10/site-packages/triton/backends/nvidia \
+    && PY_INCLUDE="$(/opt/trellis2-venv/bin/python -c 'import sysconfig; print(sysconfig.get_path("include"))')" \
+    && gcc -fPIC -c -I"$PY_INCLUDE" -I"$TRITON_DRIVER/include" "$TRITON_DRIVER/driver.c" -o /tmp/triton-driver.o \
+    && rm /tmp/triton-driver.o
 
 CMD ["python", "-u", "rp_handler.py"]
