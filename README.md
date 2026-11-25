@@ -225,3 +225,24 @@ clay generate --image nganya.png --format glb --target-tris 60000
 See [CONTRIBUTING.md](CONTRIBUTING.md). MIT licensed.
 
 Built by [OpenX-Inc](https://github.com/OpenX-Inc). 🏺
+
+### RunPod Serverless
+
+The queue accepts the same `image_b64` or `prompt` jobs and writes the same
+`glb_url` response to R2 when object storage is configured.
+
+- Image generation uses the legacy model by default. Set
+  `CLAY_IMAGE_BACKEND=sprint3d` on the CUDA 12.8 image to enable TRELLIS.2
+  for image jobs and keep TRELLIS text generation in its original runtime.
+- The TRELLIS.2 worker runs with low VRAM enabled and uses Sprint3D's GPU
+  mesh path. It preserves the request's triangle target and defaults to a
+  1024-pixel texture atlas (`CLAY_TRELLIS2_TEXSIZE`).
+- For TRELLIS.2, configure a Hugging Face token with access to
+  `facebook/dinov3-vitl16-pretrain-lvd1689m`, or specify an authorized local
+  checkpoint with `CLAY_DINOV3_PATH`. Model weights load on the first request.
+  RunPod's cached TRELLIS.2-4B snapshot is used when its pinned revision is
+  already mounted. `CLAY_TRELLIS2_WEIGHTS` can point to the pinned local
+  snapshot instead.
+- TRELLIS.2 responses include model-load time, image-to-GLB time, peak
+  allocated and reserved CUDA memory, and R2 upload time for URL output.
+  RunPod reports queue delay separately.

@@ -6,6 +6,7 @@ import gc
 import io
 import logging
 import os
+import time
 import uuid
 
 from PIL import Image, UnidentifiedImageError
@@ -81,8 +82,6 @@ def _upload_glb(mesh, bucket, endpoint_url, job_id):
 
 
 def handler(job):
-    global _active_mode
-
     inputs = job.get("input")
     if not isinstance(inputs, dict):
         return {"error": "Expected an input object"}
@@ -123,6 +122,50 @@ def handler(job):
     except ValueError as exc:
         return {"error": str(exc)}
 
+    if os.environ.get("CLAY_IMAGE_BACKEND") == "sprint3d":
+        from rp_process import generate
+
+        backend = "trellis2" if mode == "image" else "legacy"
+        mesh, triangles, metrics = generate(
+            backend, mode, image=image, prompt=prompt, target=target, seed=seed,
+        )
+    else:
+        mesh, triangles = _generate_legacy(mode, image, prompt, target, seed)
+        metrics = {}
+
+    if not mesh.startswith(b"glTF") or triangles <= 0:
+        raise RuntimeError("Clay returned an invalid or empty GLB")
+    result = {
+        "format": "glb",
+        "triangles": triangles,
+        "textures": [],
+        "size_bytes": len(mesh),
+    }
+    if metrics:
+        result["metrics"] = metrics
+    if upload:
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        try:
+            started = time.perf_counter()
+            result.update(_upload_glb(mesh, bucket, endpoint_url, job.get("id")))
+            if metrics:
+                metrics["r2_upload_s"] = round(time.perf_counter() - started, 3)
+        except ClientError as exc:
+            LOGGER.error("GLB upload failed with S3 error %s", exc.response.get("Error", {}).get("Code"))
+            return {"error": "GLB upload to object storage failed. See worker logs."}
+        except BotoCoreError as exc:
+            LOGGER.error("GLB upload failed with %s", type(exc).__name__)
+            return {"error": "GLB upload to object storage failed. See worker logs."}
+        return result
+    if len(mesh) > MAX_INLINE_BYTES:
+        return {"error": "GLB exceeds the 7 MiB inline limit. Use URL output."}
+    result["mesh_b64"] = base64.b64encode(mesh).decode("ascii")
+    return result
+
+
+def _generate_legacy(mode, image, prompt, target, seed):
+    global _active_mode
     from clay.gpu_backend import runtime
 
     # Runpod's default queue invokes one job per worker. Keep only the model
@@ -136,7 +179,7 @@ def handler(job):
         torch.cuda.empty_cache()
     _active_mode = mode
 
-    mesh, triangles = runtime.generate(
+    return runtime.generate(
         PROVIDER,
         mode,
         image_b64=image,
@@ -145,30 +188,6 @@ def handler(job):
         target_tris=target,
         seed=seed,
     )
-    if not mesh.startswith(b"glTF") or triangles <= 0:
-        raise RuntimeError("Clay returned an invalid or empty GLB")
-    result = {
-        "format": "glb",
-        "triangles": triangles,
-        "textures": [],
-        "size_bytes": len(mesh),
-    }
-    if upload:
-        from botocore.exceptions import BotoCoreError, ClientError
-
-        try:
-            result.update(_upload_glb(mesh, bucket, endpoint_url, job.get("id")))
-        except ClientError as exc:
-            LOGGER.error("GLB upload failed with S3 error %s", exc.response.get("Error", {}).get("Code"))
-            return {"error": "GLB upload to object storage failed. See worker logs."}
-        except BotoCoreError as exc:
-            LOGGER.error("GLB upload failed with %s", type(exc).__name__)
-            return {"error": "GLB upload to object storage failed. See worker logs."}
-        return result
-    if len(mesh) > MAX_INLINE_BYTES:
-        return {"error": "GLB exceeds the 7 MiB inline limit. Use URL output."}
-    result["mesh_b64"] = base64.b64encode(mesh).decode("ascii")
-    return result
 
 
 if __name__ == "__main__":
