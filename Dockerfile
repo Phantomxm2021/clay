@@ -49,7 +49,7 @@ RUN python -m pip install --no-cache-dir --no-build-isolation \
 FROM nvidia/cuda:12.1.1-base-ubuntu22.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates libegl1 libgl1 libgles2 libglib2.0-0 libgomp1 \
+    ca-certificates libegl1 libgl1 libgles2 libglib2.0-0 libgomp1 libusb-1.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 ENV ATTN_BACKEND=xformers \
@@ -70,6 +70,6 @@ WORKDIR /app
 COPY src /app/src
 COPY rp_handler.py /app/rp_handler.py
 RUN python -m pip check \
-    && python -c 'import torch, nvdiffrast.torch, diffoctreerast, diff_gaussian_rasterization; import trellis.pipelines, clay.gpu_backend.runtime, rp_handler; assert "error" in rp_handler.handler({"input": {}})'
+    && python -c 'import torch, nvdiffrast.torch, diffoctreerast, diff_gaussian_rasterization; import trellis.pipelines, trellis.utils.postprocessing_utils, clay.gpu_backend.runtime, rp_handler; assert "error" in rp_handler.handler({"input": {}})'
 
 CMD ["python", "-u", "rp_handler.py"]
