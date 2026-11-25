@@ -1,24 +1,17 @@
 FROM ghcr.io/astral-sh/uv:0.8.22 AS uv
-FROM nvidia/cuda:12.1.1-devel-ubuntu22.04
+FROM nvidia/cuda:12.1.1-devel-ubuntu22.04 AS build
 
 COPY --from=uv /uv /usr/local/bin/uv
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential ca-certificates ffmpeg git libegl1 libgl1 libgles2 libglib2.0-0 ninja-build \
+    build-essential ca-certificates git ninja-build \
     && rm -rf /var/lib/apt/lists/*
 
 ARG TRELLIS_REF=442aa1e1afb9014e80681d3bf604e8d728a86ee7
 ARG TORCH_CUDA_ARCH_LIST=8.0
 ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
     MAX_JOBS=4 \
-    ATTN_BACKEND=xformers \
-    SPCONV_ALGO=native \
-    HF_HOME=/models/huggingface \
-    TORCH_HOME=/models/torch \
-    U2NET_HOME=/models/u2net \
     UV_PYTHON_INSTALL_DIR=/opt/python \
-    PATH=/opt/clay-venv/bin:$PATH \
-    PYTHONPATH=/app/src:/opt/trellis \
-    PYTHONUNBUFFERED=1
+    PATH=/opt/clay-venv/bin:$PATH
 
 # Match Clay's Modal GPU image. Clay is imported from source so the package
 # metadata's Python and Torch minimums do not replace the validated CUDA stack.
@@ -53,10 +46,30 @@ RUN python -m pip install --no-cache-dir --no-build-isolation \
         /tmp/mip-splatting/submodules/diff-gaussian-rasterization \
     && rm -rf /tmp/diffoctreerast /tmp/mip-splatting
 
+FROM nvidia/cuda:12.1.1-base-ubuntu22.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libegl1 libgl1 libgles2 libglib2.0-0 libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV ATTN_BACKEND=xformers \
+    SPCONV_ALGO=native \
+    CUDA_MODULE_LOADING=LAZY \
+    HF_HOME=/models/huggingface \
+    TORCH_HOME=/models/torch \
+    U2NET_HOME=/models/u2net \
+    PATH=/opt/clay-venv/bin:$PATH \
+    PYTHONPATH=/app/src:/opt/trellis \
+    PYTHONUNBUFFERED=1
+
+# The CUDA extensions are already compiled. Only the Python runtime, wheels,
+# and TRELLIS source move into the worker image.
+COPY --from=build /opt/ /opt/
+
 WORKDIR /app
 COPY src /app/src
 COPY rp_handler.py /app/rp_handler.py
 RUN python -m pip check \
-    && python -c 'import clay.gpu_backend.runtime, rp_handler; assert "error" in rp_handler.handler({"input": {}})'
+    && python -c 'import torch, nvdiffrast.torch, diffoctreerast, diff_gaussian_rasterization; import trellis.pipelines, clay.gpu_backend.runtime, rp_handler; assert "error" in rp_handler.handler({"input": {}})'
 
 CMD ["python", "-u", "rp_handler.py"]
