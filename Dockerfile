@@ -46,6 +46,10 @@ RUN python -m pip install --no-cache-dir --no-build-isolation \
         /tmp/mip-splatting/submodules/diff-gaussian-rasterization \
     && rm -rf /tmp/diffoctreerast /tmp/mip-splatting
 
+FROM build AS trellis-export
+COPY trellis-glb-material.patch /tmp/trellis-glb-material.patch
+RUN git -C /opt/trellis apply /tmp/trellis-glb-material.patch
+
 FROM nvidia/cuda:12.1.1-base-ubuntu22.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -65,6 +69,7 @@ ENV ATTN_BACKEND=xformers \
 # The CUDA extensions are already compiled. Only the Python runtime, wheels,
 # and TRELLIS source move into the worker image.
 COPY --from=build /opt/ /opt/
+COPY --from=trellis-export /opt/trellis/trellis/utils/postprocessing_utils.py /opt/trellis/trellis/utils/postprocessing_utils.py
 
 WORKDIR /app
 COPY src /app/src
