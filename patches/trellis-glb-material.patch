@@ -1,0 +1,40 @@
+--- a/trellis/utils/postprocessing_utils.py
++++ b/trellis/utils/postprocessing_utils.py
+@@ -258,3 +258,3 @@
+ 
+-def parametrize_mesh(vertices: np.array, faces: np.array):
++def parametrize_mesh(vertices: np.array, faces: np.array, *, return_mapping: bool = False):
+     """
+@@ -272,2 +272,4 @@
+ 
++    if return_mapping:
++        return vertices, faces, uvs, vmapping
+     return vertices, faces, uvs
+@@ -438,4 +440,8 @@
+ 
+-    # parametrize mesh
+-    vertices, faces, uvs = parametrize_mesh(vertices, faces)
++    # Compute smooth normals before xatlas splits vertices at UV seams.
++    surface = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
++    normals = surface.vertex_normals.copy()
++    invalid = ~np.isfinite(normals).all(axis=1) | (np.linalg.norm(normals, axis=1) < 1e-8)
++    normals[invalid] = (0.0, 0.0, 1.0)
++    vertices, faces, uvs, vmapping = parametrize_mesh(vertices, faces, return_mapping=True)
+ 
+@@ -456,4 +462,7 @@
+     # rotate mesh (from z-up to y-up)
+-    vertices = vertices @ np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
++    rotation = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
++    vertices = vertices @ rotation
++    normals = normals[vmapping] @ rotation
+     material = trimesh.visual.material.PBRMaterial(
++        metallicFactor=0.0,
+         roughnessFactor=1.0,
+@@ -462,3 +471,6 @@
+     )
+-    mesh = trimesh.Trimesh(vertices, faces, visual=trimesh.visual.TextureVisuals(uv=uvs, material=material))
++    mesh = trimesh.Trimesh(
++        vertices=vertices, faces=faces, vertex_normals=normals, process=False,
++        visual=trimesh.visual.TextureVisuals(uv=uvs, material=material),
++    )
+     return mesh
