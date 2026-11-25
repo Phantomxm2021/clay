@@ -4,10 +4,16 @@ import base64
 import binascii
 import gc
 import io
+import logging
+import os
+import uuid
 
 from PIL import Image, UnidentifiedImageError
 
+LOGGER = logging.getLogger(__name__)
 PROVIDER = "trellis2"
+GLB_CONTENT_TYPE = "model/gltf-binary"
+DOWNLOAD_URL_TTL = 3600
 MAX_INLINE_BYTES = 7 * 1024 * 1024
 MAX_BASE64_CHARS = 4 * ((MAX_INLINE_BYTES + 2) // 3)
 MAX_IMAGE_PIXELS = 16_000_000
@@ -37,6 +43,43 @@ def _image_payload(value):
     return value
 
 
+def _upload_glb(mesh, bucket, endpoint_url, job_id):
+    import boto3
+    from botocore.config import Config
+
+    client = boto3.client(
+        "s3",
+        endpoint_url=endpoint_url,
+        region_name=os.environ.get("AWS_DEFAULT_REGION") or "auto",
+        config=Config(
+            signature_version="s3v4",
+            connect_timeout=5,
+            read_timeout=30,
+            retries={"mode": "standard", "total_max_attempts": 3},
+            s3={"addressing_style": "path"},
+            request_checksum_calculation="when_required",
+            response_checksum_validation="when_required",
+        ),
+    )
+    if isinstance(job_id, str) and job_id:
+        asset_id = uuid.uuid5(uuid.NAMESPACE_URL, f"clay-runpod:{job_id}").hex
+    else:
+        asset_id = uuid.uuid4().hex
+    object_key = f"clay/{asset_id}.glb"
+    client.put_object(
+        Bucket=bucket,
+        Key=object_key,
+        Body=mesh,
+        ContentType=GLB_CONTENT_TYPE,
+    )
+    glb_url = client.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": bucket, "Key": object_key},
+        ExpiresIn=DOWNLOAD_URL_TTL,
+    )
+    return {"asset_id": asset_id, "object_key": object_key, "glb_url": glb_url}
+
+
 def handler(job):
     global _active_mode
 
@@ -50,7 +93,20 @@ def handler(job):
     prompt = inputs.get("prompt")
     target = inputs.get("target_tris", inputs.get("target_triangles", 30000))
     seed = inputs.get("seed", 42)
+    output_format = inputs.get("output_format", "auto")
+    bucket = os.environ.get("CLAY_OUTPUT_BUCKET")
+    upload = output_format == "url" or (output_format == "auto" and bool(bucket))
+    endpoint_url = os.environ.get("CLAY_OUTPUT_ENDPOINT_URL")
     try:
+        if output_format not in ("auto", "url", "base64"):
+            raise ValueError("output_format must be auto, url, or base64")
+        if upload and not (
+            bucket
+            and endpoint_url
+            and os.environ.get("AWS_ACCESS_KEY_ID")
+            and os.environ.get("AWS_SECRET_ACCESS_KEY")
+        ):
+            raise ValueError("Object storage is missing bucket, endpoint, or credentials")
         if (image is None) == (prompt is None):
             raise ValueError("Provide either image_b64 or prompt")
         if type(target) is not int or not 1000 <= target <= 200000:
@@ -91,15 +147,28 @@ def handler(job):
     )
     if not mesh.startswith(b"glTF") or triangles <= 0:
         raise RuntimeError("Clay returned an invalid or empty GLB")
-    if len(mesh) > MAX_INLINE_BYTES:
-        return {"error": "GLB exceeds the 7 MiB inline limit. Retry with a smaller target_tris."}
-    return {
-        "mesh_b64": base64.b64encode(mesh).decode("ascii"),
+    result = {
         "format": "glb",
         "triangles": triangles,
         "textures": [],
         "size_bytes": len(mesh),
     }
+    if upload:
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        try:
+            result.update(_upload_glb(mesh, bucket, endpoint_url, job.get("id")))
+        except ClientError as exc:
+            LOGGER.error("GLB upload failed with S3 error %s", exc.response.get("Error", {}).get("Code"))
+            return {"error": "GLB upload to object storage failed. See worker logs."}
+        except BotoCoreError as exc:
+            LOGGER.error("GLB upload failed with %s", type(exc).__name__)
+            return {"error": "GLB upload to object storage failed. See worker logs."}
+        return result
+    if len(mesh) > MAX_INLINE_BYTES:
+        return {"error": "GLB exceeds the 7 MiB inline limit. Use URL output."}
+    result["mesh_b64"] = base64.b64encode(mesh).decode("ascii")
+    return result
 
 
 if __name__ == "__main__":
