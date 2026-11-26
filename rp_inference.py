@@ -12,7 +12,7 @@ import tempfile
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import lru_cache
 from pathlib import Path
 from unittest.mock import patch
@@ -283,6 +283,14 @@ def _load_trellis2():
         faulthandler.cancel_dump_traceback_later()
 
 
+def _reference_image(encoded):
+    from PIL import Image, ImageOps
+
+    with Image.open(io.BytesIO(base64.b64decode(encoded))) as image:
+        oriented = ImageOps.exif_transpose(image)
+        return oriented.convert("RGBA" if "A" in oriented.getbands() or "transparency" in oriented.info else "RGB")
+
+
 def _trellis2_image(request, output):
     load_started = time.perf_counter()
     method, _ = _load_trellis2()
@@ -290,9 +298,17 @@ def _trellis2_image(request, output):
 
     import torch
     from baseline_io import Stages
+    from clay.gpu_backend.multiview import condition_reference_views
 
     image = output.with_name("input-image")
-    image.write_bytes(base64.b64decode(request["image"]))
+    views = request.get("views")
+    if views:
+        with _reference_image(views["front"]) as front:
+            front.save(image, format="PNG")
+        references = [_reference_image(views[name]) for name in ("side", "back") if name in views]
+    else:
+        image.write_bytes(base64.b64decode(request["image"]))
+        references = []
     method.target_tris = request["target"]
     method.texture_size = int(os.environ.get("CLAY_TRELLIS2_TEXSIZE", "1024"))
     method.keep_pbr_source = request.get("pbr_bake", False)
@@ -301,7 +317,8 @@ def _trellis2_image(request, output):
     torch.cuda.reset_peak_memory_stats()
     stages = Stages()
     started = time.perf_counter()
-    with _stage("generate mesh and bake PBR maps"):
+    conditioning = condition_reference_views(method.pipe, references) if references else nullcontext()
+    with _stage("generate mesh and bake PBR maps"), torch.no_grad(), conditioning:
         stats = method.run(str(image), output.parent, request["seed"], stages)
     torch.cuda.synchronize()
     metrics = {
@@ -310,6 +327,8 @@ def _trellis2_image(request, output):
         "peak_allocated_mib": round(torch.cuda.max_memory_allocated() / 2**20, 1),
         "peak_reserved_mib": round(torch.cuda.max_memory_reserved() / 2**20, 1),
     }
+    if views:
+        metrics["reference_views"] = len(views)
     require_pbr(output.read_bytes())
     return {"triangles": stats["output_faces"], "metrics": metrics}
 

@@ -18,6 +18,7 @@ DOWNLOAD_URL_TTL = 3600
 MAX_INLINE_BYTES = 7 * 1024 * 1024
 MAX_BASE64_CHARS = 4 * ((MAX_INLINE_BYTES + 2) // 3)
 MAX_IMAGE_PIXELS = 16_000_000
+VIEW_NAMES = ("front", "side", "back")
 
 _active_mode = None
 
@@ -42,6 +43,17 @@ def _image_payload(value):
     except (binascii.Error, UnidentifiedImageError, OSError, SyntaxError, Image.DecompressionBombError) as exc:
         raise ValueError("Expected a valid PNG, JPEG or WebP image encoded in base64") from exc
     return value
+
+
+def _view_payloads(value):
+    if (not isinstance(value, dict) or "front" not in value or len(value) < 2
+            or not value.keys() <= set(VIEW_NAMES)):
+        raise ValueError("views_b64 needs front and at least one of side or back")
+    views = {name: _image_payload(value[name]) for name in VIEW_NAMES if name in value}
+    raw_size = sum(len(data) // 4 * 3 - (len(data) - len(data.rstrip("="))) for data in views.values())
+    if raw_size > MAX_INLINE_BYTES:
+        raise ValueError("Reference images together exceed the 7 MiB limit")
+    return views
 
 
 def _storage_client(endpoint_url):
@@ -103,6 +115,7 @@ def handler(job):
         return {"error": "This worker supports provider trellis2 and format glb"}
 
     image = inputs.get("image_b64", inputs.get("image_base64"))
+    views = inputs.get("views_b64")
     prompt = inputs.get("prompt")
     target = inputs.get("target_tris", inputs.get("target_triangles", 30000))
     seed = inputs.get("seed", 42)
@@ -111,6 +124,7 @@ def handler(job):
     bucket = os.environ.get("CLAY_OUTPUT_BUCKET")
     upload = output_format == "url" or (output_format == "auto" and bool(bucket))
     endpoint_url = os.environ.get("CLAY_OUTPUT_ENDPOINT_URL")
+    sprint3d = os.environ.get("CLAY_IMAGE_BACKEND") == "sprint3d"
     try:
         if output_format not in ("auto", "url", "base64"):
             raise ValueError("output_format must be auto, url, or base64")
@@ -121,17 +135,22 @@ def handler(job):
             and os.environ.get("AWS_SECRET_ACCESS_KEY")
         ):
             raise ValueError("Object storage is missing bucket, endpoint, or credentials")
-        if (image is None) == (prompt is None):
-            raise ValueError("Provide either image_b64 or prompt")
+        if sum(value is not None for value in (image, views, prompt)) != 1:
+            raise ValueError("Provide exactly one of image_b64, views_b64 or prompt")
+        if views is not None and not sprint3d:
+            raise ValueError("Multi-view requests need the TRELLIS.2 sprint3d backend")
         if type(pbr_bake) is not bool:
             raise ValueError("pbr_bake must be a boolean")
-        if pbr_bake and (image is None or not upload or os.environ.get("CLAY_IMAGE_BACKEND") != "sprint3d"):
+        if pbr_bake and (prompt is not None or not upload or not sprint3d):
             raise ValueError("PBR baking needs TRELLIS.2 image generation with R2 storage")
         if type(target) is not int or not 1000 <= target <= 200000:
             raise ValueError("target_tris must be an integer from 1000 to 200000")
         if type(seed) is not int or not 0 <= seed < 2**32:
             raise ValueError("seed must be a nonnegative 32-bit integer")
-        if image is not None:
+        if views is not None:
+            mode = "image"
+            views = _view_payloads(views)
+        elif image is not None:
             mode = "image"
             image = _image_payload(image)
         else:
@@ -145,12 +164,13 @@ def handler(job):
         return {"error": "This Clay endpoint accepts image requests"}
 
     source = None
-    if os.environ.get("CLAY_IMAGE_BACKEND") == "sprint3d":
+    if sprint3d:
         from rp_process import generate
 
         backend = "trellis2" if mode == "image" else "legacy"
         mesh, triangles, metrics, source = generate(
             backend, mode, image=image, prompt=prompt, target=target, seed=seed, pbr_bake=pbr_bake,
+            views=views,
         )
         if pbr_bake and not source:
             raise RuntimeError("Clay did not produce a PBR bake source")

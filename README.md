@@ -231,6 +231,13 @@ Built by [OpenX-Inc](https://github.com/OpenX-Inc). 🏺
 The queue accepts the same `image_b64` or `prompt` jobs and writes the same
 `glb_url` response to R2 when object storage is configured.
 
+On the TRELLIS.2 worker, send `views_b64` to generate one mesh from two or three
+views of the same object. The object accepts `front` and at least one of `side`
+or `back`. For example, `{"input":{"views_b64":{"front":"<base64>","side":"<base64>"}}}`.
+Use PNG, JPEG or WebP and keep the decoded inputs within 7 MiB in total. The
+samplers alternate the reference conditions on one latent trajectory. Set
+`pbr_bake: true` to request the existing R2 handoff to the CPU baking worker.
+
 - Image generation uses the legacy model by default. Set
   `CLAY_IMAGE_BACKEND=sprint3d` on the CUDA 12.8 image to enable TRELLIS.2
   for image jobs and keep TRELLIS text generation in its original runtime.

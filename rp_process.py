@@ -89,7 +89,7 @@ def _start_backend(backend):
     _backend_scratch = scratch
 
 
-def generate(backend, mode, *, image, prompt, target, seed, pbr_bake=False):
+def generate(backend, mode, *, image, prompt, target, seed, pbr_bake=False, views=None):
     if _active_backend != backend or _active_process.poll() is not None:
         _start_backend(backend)
 
@@ -99,6 +99,8 @@ def generate(backend, mode, *, image, prompt, target, seed, pbr_bake=False):
         output = Path(directory) / "model.glb"
         request = dict(mode=mode, image=image, prompt=prompt, target=target, seed=seed, output=str(output),
                        pbr_bake=pbr_bake)
+        if views is not None:
+            request["views"] = views
         try:
             _active_process.stdin.write(json.dumps(request) + "\n")
             _active_process.stdin.flush()
