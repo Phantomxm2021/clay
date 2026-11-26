@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 import pytest
 import rp_inference as inference
@@ -7,6 +8,63 @@ import rp_inference as inference
 def _write(path, content):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(content)
+
+
+@pytest.mark.parametrize("pipeline_type", ["1024_cascade", "512"])
+def test_skip_texture_512_only_for_cascade(tmp_path, pipeline_type):
+    models = {
+        key: f"ckpts/{key}"
+        for key in (
+            "shape_slat_flow_model_512",
+            "shape_slat_flow_model_1024",
+            "tex_slat_flow_model_512",
+            "tex_slat_flow_model_1024",
+        )
+    }
+    _write(
+        tmp_path / "pipeline.json",
+        json.dumps(
+            {
+                "args": {"models": models, "default_pipeline_type": pipeline_type},
+            }
+        ).encode(),
+    )
+    actual = inference._read_pipeline_config(tmp_path)["args"]["models"]
+    if pipeline_type == "1024_cascade":
+        models.pop("tex_slat_flow_model_512")
+    assert actual == models
+
+
+def test_fast_checkpoint_preserves_upstream_output_and_dtype(tmp_path):
+    torch = pytest.importorskip("torch")
+    safetensors = pytest.importorskip("safetensors.torch")
+
+    class Flow(torch.nn.Linear):
+        def __init__(self, extra=False):
+            super().__init__(2, 2, dtype=torch.float32)
+            if extra:
+                self.register_buffer("extra", torch.ones(2), persistent=False)
+
+    path = tmp_path / "flow"
+    _write(path.with_suffix(".json"), b'{"name":"SLatFlowModel","args":{}}')
+    weights = {
+        "weight": torch.tensor([[1.5, 2], [3, -4]], dtype=torch.float16),
+        "bias": torch.tensor([0.5, 1], dtype=torch.float16),
+    }
+    safetensors.save_file(weights, path.with_suffix(".safetensors"))
+
+    models = SimpleNamespace(SLatFlowModel=Flow)
+    fast = inference._load_flow_checkpoint(models, path, {})
+    stock = Flow()
+    stock.load_state_dict(weights)
+    inputs = torch.tensor([[2.0, -3.0]])
+    torch.testing.assert_close(fast(inputs), stock(inputs), atol=0, rtol=0)
+    assert fast.weight.dtype == stock.weight.dtype
+    assert inference._load_flow_checkpoint(models, path, {"extra": True}) is None
+
+    del weights["bias"]
+    safetensors.save_file(weights, path.with_suffix(".safetensors"))
+    assert inference._load_flow_checkpoint(models, path, {}) is None
 
 
 @pytest.mark.parametrize("cache_state", ["complete", "partial", "other_revision"])

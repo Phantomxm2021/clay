@@ -127,7 +127,9 @@ RUN python -m pip install --no-cache-dir \
     && python -m pip check \
     && python -c 'from importlib.util import find_spec; assert all(find_spec(m) for m in ("flash_attn", "flex_gemm", "cumesh", "o_voxel", "nvdiffrast"))'
 
-FROM nvidia/cuda:12.8.1-runtime-ubuntu22.04
+# Both PyTorch environments already provide their versioned CUDA libraries.
+# Keep the driver integration and C runtime in the base image.
+FROM nvidia/cuda:12.8.1-base-ubuntu22.04
 
 RUN apt-get -o Acquire::Retries=5 -o Acquire::http::No-Cache=true update \
     && apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
@@ -159,7 +161,7 @@ WORKDIR /app
 COPY --link src /app/src
 COPY --link rp_handler.py rp_process.py rp_inference.py /app/
 RUN python -c 'import torch; import trellis.pipelines, trellis.utils.postprocessing_utils, rp_handler; assert "error" in rp_handler.handler({"input": {}})' \
-    && /opt/trellis2-venv/bin/python -c 'import torch, flash_attn; assert torch.version.cuda == "12.8"' \
+    && /opt/trellis2-venv/bin/python -c 'import torch, flash_attn, cumesh, o_voxel, nvdiffrast.torch, flex_gemm.ops.grid_sample; assert torch.version.cuda == "12.8"' \
     && TRITON_DRIVER=/opt/trellis2-venv/lib/python3.10/site-packages/triton/backends/nvidia \
     && PY_INCLUDE="$(/opt/trellis2-venv/bin/python -c 'import sysconfig; print(sysconfig.get_path("include"))')" \
     && gcc -fPIC -c -I"$PY_INCLUDE" -I"$TRITON_DRIVER/include" "$TRITON_DRIVER/driver.c" -o /tmp/triton-driver.o \

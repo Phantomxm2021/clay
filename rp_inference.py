@@ -67,13 +67,22 @@ def _patch_birefnet_config(path):
     path.write_text(source.replace(config_init, compatible_init, 1))
 
 
+def _read_pipeline_config(weights):
+    config = json.loads((weights / "pipeline.json").read_text())
+    args = config["args"]
+    # The 1024 cascade uses both shape flows and only the 1024 texture flow.
+    if args.get("default_pipeline_type", "1024_cascade") == "1024_cascade":
+        args["models"].pop("tex_slat_flow_model_512", None)
+    return config
+
+
 def _stage_cached_weights(work_dir, weights, hosted_weights):
     """Use RunPod's exact main snapshot and stage the remaining volume files locally."""
     cache = Path(os.environ["HF_HUB_CACHE"])
     dino = Path(os.environ.get("CLAY_DINOV3_PATH") or _snapshot(cache, DINO_REPO, DINO_REVISION))
     birefnet = _snapshot(cache, BIREFNET_REPO, BIREFNET_REVISION)
     sparse = _snapshot(cache, SPARSE_REPO, SPARSE_REVISION)
-    config = json.loads((weights / "pipeline.json").read_text())
+    config = _read_pipeline_config(weights)
     args = config["args"]
     copies, main_files = [], []
     for key, checkpoint in args["models"].items():
@@ -234,7 +243,7 @@ def _prepare_weights(work_dir):
             TRELLIS2_REPO, revision=TRELLIS2_REVISION, allow_patterns=["pipeline.json", "ckpts/*"]
         )
     weights = Path(weights).resolve()
-    config = json.loads((weights / "pipeline.json").read_text())
+    config = _read_pipeline_config(weights)
     args = config["args"]
     args["image_cond_model"]["args"]["model_name"] = str(dino_path)
     args["rembg_model"]["args"]["model_name"] = snapshot_download(
@@ -246,6 +255,40 @@ def _prepare_weights(work_dir):
     (work_dir / "ckpts").symlink_to(weights / "ckpts", target_is_directory=True)
     source = "runpod_cached_model" if weights == cached.resolve() else "hugging_face"
     return {"model_weights_source": "configured_path" if configured else source}
+
+
+def _load_flow_checkpoint(models, path, kwargs):
+    """Load complete local flow weights without initializing discarded CPU weights."""
+    config_path = Path(f"{path}.json")
+    weights_path = Path(f"{path}.safetensors")
+    if not config_path.is_file() or not weights_path.is_file():
+        return None
+    config = json.loads(config_path.read_text())
+    if config["name"] not in {"SparseStructureFlowModel", "SLatFlowModel", "ElasticSLatFlowModel"}:
+        return None
+
+    import torch
+    from safetensors.torch import load_file
+
+    try:
+        with torch.device("meta"):
+            model = getattr(models, config["name"])(**config["args"], **kwargs)
+        expected = model.state_dict()
+        tensors = load_file(weights_path, device="cpu")
+        if tensors.keys() != expected.keys():
+            return None
+        tensors = {name: tensor.to(dtype=expected[name].dtype) for name, tensor in tensors.items()}
+        model.load_state_dict(tensors, strict=True, assign=True)
+        if any(tensor.is_meta for module in model.modules() for tensor in vars(module).values()
+               if isinstance(tensor, torch.Tensor)):
+            return None
+        if any(buffer.is_meta for buffer in model.buffers()) or any(p.is_meta for p in model.parameters()):
+            return None
+    except (RuntimeError, TypeError, ValueError) as error:
+        print(f"Clay TRELLIS.2 using upstream loader for {Path(path).name} ({type(error).__name__})",
+              file=sys.stderr, flush=True)
+        return None
+    return model
 
 
 @lru_cache(maxsize=1)
@@ -295,13 +338,19 @@ def _load_trellis2():
             weights=work_dir.name, record_latents=False, keep_models_on_gpu=False,
         )
         initialized = time.perf_counter()
+        fast_checkpoints = 0
+        fast_load = os.environ.get("CLAY_TRELLIS2_FAST_LOAD", "1") == "1"
         with _stage("initialize model and GPU extensions"):
             from trellis2 import models
 
             load_checkpoint = models.from_pretrained
 
             def load_timed(path, **kwargs):
+                nonlocal fast_checkpoints
                 with _stage(f"load {Path(path).name}"):
+                    if fast_load and (model := _load_flow_checkpoint(models, path, kwargs)) is not None:
+                        fast_checkpoints += 1
+                        return model
                     return load_checkpoint(path, **kwargs)
 
             with patch.object(models, "from_pretrained", load_timed):
@@ -311,6 +360,7 @@ def _load_trellis2():
             "model_import_s": round(imported, 3),
             "model_stage_s": round(staged, 3),
             "model_init_s": round(time.perf_counter() - initialized, 3),
+            "model_fast_checkpoints": fast_checkpoints,
         }
     except BaseException:
         work_dir.cleanup()
@@ -374,6 +424,7 @@ def _trellis2_image(request, output):
         "image_to_glb_s": round(time.perf_counter() - started, 3),
         "peak_allocated_mib": round(torch.cuda.max_memory_allocated() / 2**20, 1),
         "peak_reserved_mib": round(torch.cuda.max_memory_reserved() / 2**20, 1),
+        "inference_stages_s": {key: round(value, 3) for key, value in stages.timings().items()},
     }
     if _preload_metrics or not model_cache_hit:
         metrics.update(initialization)
