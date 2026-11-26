@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 FROM ghcr.io/astral-sh/uv:0.8.22 AS uv
 FROM nvidia/cuda:12.1.1-devel-ubuntu22.04 AS build
 
@@ -145,16 +146,18 @@ ENV ATTN_BACKEND=xformers \
     CLAY_IMAGE_BACKEND=sprint3d \
     CLAY_TRELLIS2_STOCK_NATIVE=1
 
-COPY --from=legacy /opt/ /opt/
-COPY --from=sprint3d-build /opt/trellis2-python/ /opt/trellis2-python/
-COPY --from=sprint3d-build /opt/trellis2-venv/ /opt/trellis2-venv/
-COPY --from=sprint3d-build /opt/TRELLIS.2/trellis2/ /opt/TRELLIS.2/trellis2/
-COPY --from=sprint3d-build /opt/TRELLIS.2/LICENSE /opt/TRELLIS.2/LICENSE
-COPY --from=sprint3d-build /opt/sprint3d/experiments/ /opt/sprint3d/experiments/
+# Merge the independent runtimes as layers rather than copying them through
+# each preceding filesystem snapshot in this combined worker.
+COPY --link --from=legacy /opt/ /opt/
+COPY --link --from=sprint3d-build /opt/trellis2-python/ /opt/trellis2-python/
+COPY --link --from=sprint3d-build /opt/trellis2-venv/ /opt/trellis2-venv/
+COPY --link --from=sprint3d-build /opt/TRELLIS.2/trellis2/ /opt/TRELLIS.2/trellis2/
+COPY --link --from=sprint3d-build /opt/TRELLIS.2/LICENSE /opt/TRELLIS.2/LICENSE
+COPY --link --from=sprint3d-build /opt/sprint3d/experiments/ /opt/sprint3d/experiments/
 
 WORKDIR /app
-COPY src /app/src
-COPY rp_handler.py rp_process.py rp_inference.py /app/
+COPY --link src /app/src
+COPY --link rp_handler.py rp_process.py rp_inference.py /app/
 RUN python -c 'import torch; import trellis.pipelines, trellis.utils.postprocessing_utils, rp_handler; assert "error" in rp_handler.handler({"input": {}})' \
     && /opt/trellis2-venv/bin/python -c 'import torch, flash_attn; assert torch.version.cuda == "12.8"' \
     && TRITON_DRIVER=/opt/trellis2-venv/lib/python3.10/site-packages/triton/backends/nvidia \
