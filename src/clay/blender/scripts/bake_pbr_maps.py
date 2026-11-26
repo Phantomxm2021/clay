@@ -9,6 +9,11 @@ import bpy  # noqa: E402
 import numpy as np  # noqa: E402
 from _common import import_mesh, join_meshes, payload, reset, run  # noqa: E402
 
+# Debian's Blender 3.4 glTF importer still uses the removed NumPy alias.
+# This subprocess exits after the bake, so the compatibility alias stays local.
+if bpy.app.version < (3, 5) and "bool" not in vars(np):
+    np.bool = bool
+
 
 def bake_image(node, path, size, kind):
     image = bpy.data.images.new(kind, size, size, alpha=False, is_data=True)
