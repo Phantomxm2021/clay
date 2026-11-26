@@ -63,3 +63,10 @@ def test_bake_rejects_maps_with_incompatible_atlas_dimensions():
     mesh = delivery_glb(png("RGB", (200, 0, 0)), png("RGB", (0, 180, 12)))
     with pytest.raises(ValueError, match="same UV atlas dimensions"):
         combine_maps(mesh, png("RGB", (128, 128, 255), size=(64, 64)), png("L", 255))
+
+
+@pytest.mark.parametrize("normal, ao", [((128, 128, 128), 200), ((128, 128, 255), 0)])
+def test_bake_rejects_empty_maps(normal, ao):
+    mesh = delivery_glb(png("RGB", (200, 0, 0)), png("RGB", (0, 180, 12)))
+    with pytest.raises(ValueError, match="empty AO or tangent normal"):
+        combine_maps(mesh, png("RGB", normal), png("L", ao))

@@ -1,8 +1,16 @@
 FROM python:3.12-slim-bookworm
 
-RUN apt-get update && apt-get install -y --no-install-recommends blender ca-certificates python3-numpy \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl xz-utils libgl1 libgomp1 libice6 libsm6 libx11-6 libx11-xcb1 \
+    libxcursor1 libxext6 libxfixes3 libxi6 libxinerama1 libxkbcommon0 libxrandr2 libxrender1 libxxf86vm1 \
     && rm -rf /var/lib/apt/lists/*
-RUN blender --background --factory-startup --python-exit-code 1 --python-expr 'import numpy'
+RUN curl -fSL --retry 3 https://download.blender.org/release/Blender4.5/blender-4.5.16-linux-x64.tar.xz \
+        -o /tmp/blender.tar.xz \
+    && echo '23432b064977908beb1ab4b7f32f024e7331105c875c187dce002aff84b10c11  /tmp/blender.tar.xz' | sha256sum -c - \
+    && mkdir -p /opt/blender && tar -xJf /tmp/blender.tar.xz -C /opt/blender --strip-components=1 \
+    && rm /tmp/blender.tar.xz
+ENV CLAY_BLENDER=/opt/blender/blender
+RUN "$CLAY_BLENDER" --background --factory-startup --python-exit-code 1 --python-expr 'import numpy'
 RUN pip install --no-cache-dir runpod==1.8.1 pillow httpx
 
 WORKDIR /app

@@ -118,6 +118,8 @@ def combine_maps(low_glb, normal_png, ao_png, tangents=None):
     ao = _png(ao_png, ("L", "RGB", "RGBA")).getchannel(0)
     if len({base.size, mr.size, normal.size, ao.size}) != 1:
         raise ValueError("All five material channels need the same UV atlas dimensions")
+    if ao.getextrema()[1] == 0 or normal.getchannel("B").getextrema()[1] <= 128:
+        raise ValueError("Blender produced an empty AO or tangent normal map")
 
     orm = Image.merge("RGB", (ao, mr.getchannel("G"), mr.getchannel("B")))
     # Keep the old bytes and all of the existing binary offsets intact. Reuse
