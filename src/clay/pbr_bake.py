@@ -75,6 +75,87 @@ def _append_view(doc, binary, data):
     return index
 
 
+def _accessor_layout(doc, index, packed_size):
+    accessor = doc["accessors"][index]
+    view = doc["bufferViews"][accessor["bufferView"]]
+    return (view.get("byteOffset", 0) + accessor.get("byteOffset", 0),
+            view.get("byteStride", packed_size), accessor["count"])
+
+
+def _unit(vector):
+    length = math.hypot(*vector)
+    if not math.isfinite(length) or length <= 1e-12:
+        return None
+    if abs(length - 1.0) <= 1e-5:
+        return vector
+    return tuple(value / length for value in vector)
+
+
+def _cross(a, b):
+    ax, ay, az = a
+    bx, by, bz = b
+    return ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx
+
+
+def _tangent_frame(tangent, sign, normal):
+    unit = _unit(tangent)
+    if unit is None:
+        axis = min(range(3), key=lambda index: abs(normal[index]))
+        unit = _unit(_cross(normal, tuple(float(index == axis) for index in range(3))))
+    return (*unit, -1.0 if sign < 0 else 1.0)
+
+
+def _repair_vertex_frames(doc, binary, primitive):
+    attributes = primitive["attributes"]
+    normal_offset, normal_stride, count = _accessor_layout(doc, attributes["NORMAL"], 12)
+    bad = {}
+    changed = False
+    for index in range(count):
+        offset = normal_offset + index * normal_stride
+        normal = struct.unpack_from("<3f", binary, offset)
+        unit = _unit(normal)
+        if unit is None:
+            bad[index] = [0.0, 0.0, 0.0]
+        elif unit != normal:
+            struct.pack_into("<3f", binary, offset, *unit)
+            changed = True
+    if bad:
+        # Recover only invalid vertices from incident faces. Isolated or
+        # entirely degenerate faces have no useful shading direction.
+        positions, stride, _ = _accessor_layout(doc, attributes["POSITION"], 12)
+        if "indices" in primitive:
+            idx = primitive["indices"]
+            fmt = {5121: "<B", 5123: "<H", 5125: "<I"}[doc["accessors"][idx]["componentType"]]
+            start, step, length = _accessor_layout(doc, idx, struct.calcsize(fmt))
+            indices = (struct.unpack_from(fmt, binary, start + i * step)[0] for i in range(length))
+        else:
+            indices = iter(range(count))
+        for triangle in zip(indices, indices, indices):
+            invalid = bad.keys() & set(triangle)
+            if not invalid:
+                continue
+            a, b, c = (struct.unpack_from("<3f", binary, positions + i * stride) for i in triangle)
+            face = _cross(tuple(y - x for x, y in zip(a, b)), tuple(y - x for x, y in zip(a, c)))
+            for i in invalid:
+                for axis, value in enumerate(face):
+                    bad[i][axis] += value
+        for index, vector in bad.items():
+            struct.pack_into("<3f", binary, normal_offset + index * normal_stride,
+                             *(_unit(tuple(vector)) or (0.0, 1.0, 0.0)))
+        changed = True
+    if "TANGENT" in attributes:
+        tangent_offset, tangent_stride, count = _accessor_layout(doc, attributes["TANGENT"], 16)
+        for index in range(count):
+            offset = tangent_offset + index * tangent_stride
+            tangent = struct.unpack_from("<4f", binary, offset)
+            normal = struct.unpack_from("<3f", binary, normal_offset + index * normal_stride)
+            repaired = _tangent_frame(tangent[:3], tangent[3], normal)
+            if repaired != tangent:
+                struct.pack_into("<4f", binary, offset, *repaired)
+                changed = True
+    return changed
+
+
 def _append_tangents(doc, binary, primitive, with_positions):
     attributes = primitive["attributes"]
     position = doc["accessors"][attributes["POSITION"]]
@@ -84,12 +165,14 @@ def _append_tangents(doc, binary, primitive, with_positions):
     stride = view.get("byteStride", 12)
     if len(with_positions) != count * 28 or position["componentType"] != 5126:
         raise ValueError("Cannot match baked tangents to the delivery GLB vertices")
+    normal_offset, normal_stride, _ = _accessor_layout(doc, attributes["NORMAL"], 12)
     tangents = bytearray()
     for index, (x, y, z, tx, ty, tz, sign) in enumerate(struct.iter_unpack("<7f", with_positions)):
         original = struct.unpack_from("<3f", binary, offset + stride * index)
         if not all(math.isclose(a, b, rel_tol=1e-6, abs_tol=1e-6) for a, b in zip(original, (x, y, z))):
             raise ValueError("Blender changed the delivery vertex order or frame")
-        tangents.extend(struct.pack("<4f", tx, ty, tz, sign))
+        normal = struct.unpack_from("<3f", binary, normal_offset + index * normal_stride)
+        tangents.extend(struct.pack("<4f", *_tangent_frame((tx, ty, tz), sign, normal)))
     target = _append_view(doc, binary, tangents)
     doc["bufferViews"][target]["target"] = 34962
     attributes["TANGENT"] = len(doc["accessors"])
@@ -153,6 +236,7 @@ def bake_pbr(high, low, output, *, blender=None):
     low_glb = low.read_bytes()
     doc, binary = _read_glb(low_glb)
     primitive = doc["meshes"][0]["primitives"][0]
+    repaired = _repair_vertex_frames(doc, binary, primitive)
     material_index = primitive["material"]
     base_info = doc["materials"][material_index]["pbrMetallicRoughness"]["baseColorTexture"]
     _, _, base_bytes = _embedded_png(doc, binary, base_info)
@@ -163,6 +247,10 @@ def bake_pbr(high, low, output, *, blender=None):
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".clay-bake-", dir=output.parent) as scratch:
         directory = Path(scratch)
+        if repaired:
+            low_glb = _write_glb(doc, binary)
+            low = directory / "repaired-low.glb"
+            low.write_bytes(low_glb)
         normal, ao = directory / "normal.png", directory / "ao.png"
         tangents = directory / "tangents.bin" if "TANGENT" not in primitive["attributes"] else None
         result = run_script("bake_pbr_maps.py", {

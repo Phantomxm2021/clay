@@ -1,10 +1,13 @@
 from io import BytesIO
+import struct
 
 import pytest
 
 Image = pytest.importorskip("PIL.Image")
 
-from clay.pbr_bake import _append_view, _embedded_png, _read_glb, _write_glb, combine_maps  # noqa: E402
+from clay.pbr_bake import (  # noqa: E402
+    _append_view, _embedded_png, _read_glb, _repair_vertex_frames, _write_glb, combine_maps,
+)
 
 
 def png(mode, color, size=(128, 128)):
@@ -70,3 +73,22 @@ def test_bake_rejects_empty_maps(normal, ao):
     mesh = delivery_glb(png("RGB", (200, 0, 0)), png("RGB", (0, 180, 12)))
     with pytest.raises(ValueError, match="empty AO or tangent normal"):
         combine_maps(mesh, png("RGB", normal), png("L", ao))
+
+
+def test_zero_normal_and_tangent_are_repaired_using_the_incident_face():
+    positions = struct.pack("<9f", 0, 0, 0, 1, 0, 0, 0, 1, 0)
+    normals = struct.pack("<9f", 0, 0, 0, 0, 0, 1, 0, 0, 1)
+    tangents = struct.pack("<12f", 0, 0, 0, 1, 1, 0, 0, -1, 1, 0, 0, 1)
+    binary = bytearray()
+    doc = {"accessors": [], "bufferViews": []}
+    for data in (positions, normals, tangents):
+        view = _append_view(doc, binary, data)
+        doc["accessors"].append({"bufferView": view, "count": 3})
+    primitive = {"attributes": {"POSITION": 0, "NORMAL": 1, "TANGENT": 2}}
+
+    assert _repair_vertex_frames(doc, binary, primitive)
+    assert struct.unpack_from("<3f", binary, len(positions)) == (0, 0, 1)
+    assert struct.unpack_from("<4f", binary, len(positions) + len(normals)) == (0, 1, 0, 1)
+    assert binary[:len(positions)] == positions
+    assert binary[-32:] == tangents[-32:]
+    assert not _repair_vertex_frames(doc, binary, primitive)
