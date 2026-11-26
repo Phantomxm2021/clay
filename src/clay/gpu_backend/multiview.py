@@ -40,6 +40,10 @@ def condition_reference_views(pipe, extra_images):
 
     with ExitStack() as stack:
         stack.enter_context(patch.object(pipe, "get_cond", multi_cond))
-        for sampler in (pipe.sparse_structure_sampler, pipe.shape_slat_sampler, pipe.tex_slat_sampler):
+        for sampler in (
+            pipe.sparse_structure_sampler,
+            pipe.shape_slat_sampler,
+            pipe.tex_slat_sampler,
+        ):
             stack.enter_context(patch.object(sampler, "sample", _cycle_conditions(sampler)))
         yield

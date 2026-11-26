@@ -1,7 +1,6 @@
 import json
 
 import pytest
-
 import rp_inference as inference
 
 
@@ -11,7 +10,7 @@ def _write(path, content):
 
 
 @pytest.mark.parametrize("cache_state", ["complete", "partial", "other_revision"])
-def test_runpod_cached_main_weights_leave_supporting_weights_on_volume(tmp_path, monkeypatch, cache_state):
+def test_runpod_cache_stages_only_supporting_weights(tmp_path, monkeypatch, cache_state):
     volume = tmp_path / "global-volume"
     hosted = tmp_path / "runpod-host-cache"
     weights = volume / "main"
@@ -24,8 +23,13 @@ def test_runpod_cached_main_weights_leave_supporting_weights_on_volume(tmp_path,
 
     primary = "ckpts/main-flow"
     support = inference.SPARSE_CHECKPOINT
-    config = {"args": {"models": {"main": primary, "sparse": f"{inference.SPARSE_REPO}/{support}"},
-                       "image_cond_model": {"args": {}}, "rembg_model": {"args": {}}}}
+    config = {
+        "args": {
+            "models": {"main": primary, "sparse": f"{inference.SPARSE_REPO}/{support}"},
+            "image_cond_model": {"args": {}},
+            "rembg_model": {"args": {}},
+        }
+    }
     _write(weights / "pipeline.json", json.dumps(config).encode())
     source = inference._snapshot(volume, inference.SPARSE_REPO, inference.SPARSE_REVISION)
     revision = "old-revision" if cache_state == "other_revision" else inference.TRELLIS2_REVISION
@@ -41,12 +45,17 @@ def test_runpod_cached_main_weights_leave_supporting_weights_on_volume(tmp_path,
         primary_bytes += len(content)
         if cache_state != "partial" or extension == ".json":
             _write(cache / f"{primary}{extension}", content)
-    for repo, revision in ((inference.DINO_REPO, inference.DINO_REVISION),
-                           (inference.BIREFNET_REPO, inference.BIREFNET_REVISION)):
+    for repo, revision in (
+        (inference.DINO_REPO, inference.DINO_REVISION),
+        (inference.BIREFNET_REPO, inference.BIREFNET_REVISION),
+    ):
         source = inference._snapshot(volume, repo, revision)
         for name in inference.SNAPSHOT_FILES[repo]:
-            content = (b"class Config(PretrainedConfig):\n    def __init__(self) -> None:\n        pass\n"
-                       if name == "birefnet.py" else b"volume dependency data")
+            content = (
+                b"class Config(PretrainedConfig):\n    def __init__(self) -> None:\n        pass\n"
+                if name == "birefnet.py"
+                else b"volume dependency data"
+            )
             _write(source / name, content)
             support_bytes += len(content)
 
