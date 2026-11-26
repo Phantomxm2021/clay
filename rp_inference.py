@@ -271,8 +271,9 @@ def _load_flow_checkpoint(models, path, kwargs):
     from safetensors.torch import load_file
 
     try:
+        factory = getattr(models, config["name"])
         with torch.device("meta"):
-            model = getattr(models, config["name"])(**config["args"], **kwargs)
+            model = factory(**config["args"], **kwargs)
         expected = model.state_dict()
         tensors = load_file(weights_path, device="cpu")
         if tensors.keys() != expected.keys():
