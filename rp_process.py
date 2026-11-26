@@ -89,10 +89,32 @@ def _start_backend(backend):
     _backend_scratch = scratch
 
 
-def generate(backend, mode, *, image, prompt, target, seed, pbr_bake=False, views=None):
+def _exchange(backend, request, timeout):
     if _active_backend != backend or _active_process.poll() is not None:
         _start_backend(backend)
+    try:
+        _active_process.stdin.write(json.dumps(request) + "\n")
+        _active_process.stdin.flush()
+        if not select.select([_reply], [], [], timeout)[0]:
+            raise TimeoutError("Clay inference exceeded the configured timeout")
+        line = _reply.readline()
+        if not line:
+            raise RuntimeError("Clay's inference process exited. See worker logs.")
+        response = json.loads(line)
+        if error := response.get("error"):
+            raise RuntimeError(error)
+        return response
+    except (OSError, ValueError, RuntimeError):
+        stop_backend()
+        raise
 
+
+def preload_trellis2():
+    timeout = int(os.environ.get("CLAY_TRELLIS2_PRELOAD_TIMEOUT_S", "300"))
+    return _exchange("trellis2", {"preload": True}, timeout)
+
+
+def generate(backend, mode, *, image, prompt, target, seed, pbr_bake=False, views=None):
     # The GLB stays on disk until the parent reads it. The pipe carries only
     # request parameters and completion metadata, separate from model logs.
     with tempfile.TemporaryDirectory(prefix="clay-inference-") as directory:
@@ -101,20 +123,11 @@ def generate(backend, mode, *, image, prompt, target, seed, pbr_bake=False, view
                        pbr_bake=pbr_bake)
         if views is not None:
             request["views"] = views
+        timeout = int(os.environ.get("CLAY_INFERENCE_TIMEOUT_S", "720"))
+        response = _exchange(backend, request, timeout)
         try:
-            _active_process.stdin.write(json.dumps(request) + "\n")
-            _active_process.stdin.flush()
-            timeout = int(os.environ.get("CLAY_INFERENCE_TIMEOUT_S", "720"))
-            if not select.select([_reply], [], [], timeout)[0]:
-                raise TimeoutError("Clay inference exceeded the configured timeout")
-            line = _reply.readline()
-            if not line:
-                raise RuntimeError("Clay's inference process exited. See worker logs.")
-            response = json.loads(line)
-            if error := response.get("error"):
-                raise RuntimeError(error)
             source = output.with_name("bake-source.glb").read_bytes() if pbr_bake else None
             return output.read_bytes(), response["triangles"], response.get("metrics", {}), source
-        except (OSError, ValueError, RuntimeError):
+        except OSError:
             stop_backend()
             raise

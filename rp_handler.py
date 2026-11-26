@@ -235,7 +235,20 @@ def _generate_legacy(mode, image, prompt, target, seed):
     )
 
 
-if __name__ == "__main__":
+def main():
     import runpod
 
+    if os.environ.get("CLAY_IMAGE_BACKEND") == "sprint3d" and os.environ.get("CLAY_TRELLIS2_PRELOAD") == "1":
+        from rp_process import preload_trellis2
+
+        try:
+            metrics = preload_trellis2()
+            LOGGER.info("Clay TRELLIS.2 preloaded in %.3fs (process %s)",
+                        metrics["model_preload_s"], metrics["model_process_boot_id"])
+        except (OSError, ValueError, RuntimeError) as error:
+            LOGGER.warning("Clay TRELLIS.2 preload failed (%s); continuing with lazy load", type(error).__name__)
     runpod.serverless.start({"handler": handler})
+
+
+if __name__ == "__main__":
+    main()

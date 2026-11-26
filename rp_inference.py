@@ -16,6 +16,7 @@ from contextlib import contextmanager, nullcontext
 from functools import lru_cache
 from pathlib import Path
 from unittest.mock import patch
+from uuid import uuid4
 
 TRELLIS2_SOURCE = "/opt/TRELLIS.2"
 TRELLIS2_REPO = "microsoft/TRELLIS.2-4B"
@@ -32,6 +33,7 @@ SNAPSHOT_FILES = {
     DINO_REPO: ("config.json", "model.safetensors", "preprocessor_config.json"),
     BIREFNET_REPO: ("config.json", "model.safetensors", "BiRefNet_config.py", "birefnet.py"),
 }
+_preload_metrics = {}
 
 
 @contextmanager
@@ -325,6 +327,15 @@ def _reference_image(encoded):
         return oriented.convert("RGBA" if "A" in oriented.getbands() or "transparency" in oriented.info else "RGB")
 
 
+def _preload_trellis2():
+    if not _preload_metrics:
+        started = time.perf_counter()
+        _load_trellis2()
+        _preload_metrics.update(model_preload_s=round(time.perf_counter() - started, 3),
+                                model_process_boot_id=uuid4().hex)
+    return _preload_metrics
+
+
 def _trellis2_image(request, output):
     model_cache_hit = _load_trellis2.cache_info().currsize > 0
     load_started = time.perf_counter()
@@ -357,13 +368,14 @@ def _trellis2_image(request, output):
         stats = method.run(str(image), output.parent, request["seed"], stages)
     torch.cuda.synchronize()
     metrics = {
+        **_preload_metrics,
         "model_load_s": round(load_s, 3),
         "model_cache_hit": model_cache_hit,
         "image_to_glb_s": round(time.perf_counter() - started, 3),
         "peak_allocated_mib": round(torch.cuda.max_memory_allocated() / 2**20, 1),
         "peak_reserved_mib": round(torch.cuda.max_memory_reserved() / 2**20, 1),
     }
-    if not model_cache_hit:
+    if _preload_metrics or not model_cache_hit:
         metrics.update(initialization)
     if views:
         metrics["reference_views"] = len(views)
@@ -390,7 +402,10 @@ def main():
         for line in sys.stdin:
             try:
                 request = json.loads(line)
-                result = run(request, Path(request["output"]))
+                if backend == "trellis2" and request.get("preload") is True:
+                    result = _preload_trellis2()
+                else:
+                    result = run(request, Path(request["output"]))
             except Exception:
                 traceback.print_exc()
                 reply.write('{"error":"Clay generation failed. See worker logs."}\n')
