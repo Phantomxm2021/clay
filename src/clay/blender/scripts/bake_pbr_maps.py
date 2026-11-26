@@ -85,8 +85,19 @@ def main():
     # in the AO scene would introduce false self-shadowing.
     bpy.data.objects.remove(high, do_unlink=True)
     bake.use_selected_to_active = False
-    scene.cycles.samples = 64
-    bake_image(node, args["ao_map"], args["resolution"], "AO")
+    tree = material.node_tree
+    occlusion = tree.nodes.new("ShaderNodeAmbientOcclusion")
+    occlusion.only_local = True
+    occlusion.samples = 24
+    occlusion.inputs["Distance"].default_value = scale * 0.04
+    geometry = tree.nodes.new("ShaderNodeNewGeometry")
+    tree.links.new(geometry.outputs["True Normal"], occlusion.inputs["Normal"])
+    emission = tree.nodes.new("ShaderNodeEmission")
+    tree.links.new(occlusion.outputs["AO"], emission.inputs["Color"])
+    tree.links.new(emission.outputs[0], tree.nodes.get("Material Output").inputs["Surface"])
+    tree.nodes.active = node
+    # A bounded hemisphere bake preserves exposed surfaces and darkens nearby concavities.
+    bake_image(node, args["ao_map"], args["resolution"], "EMIT")
     return {"ok": True}
 
 
