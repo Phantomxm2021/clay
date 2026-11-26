@@ -89,7 +89,8 @@ def main():
     occlusion = tree.nodes.new("ShaderNodeAmbientOcclusion")
     occlusion.only_local = True
     occlusion.samples = 24
-    occlusion.inputs["Distance"].default_value = scale * 0.04
+    # Short contact rays avoid darkening broad exterior faces near thin shells.
+    occlusion.inputs["Distance"].default_value = scale * 0.01
     geometry = tree.nodes.new("ShaderNodeNewGeometry")
     tree.links.new(geometry.outputs["True Normal"], occlusion.inputs["Normal"])
     emission = tree.nodes.new("ShaderNodeEmission")
