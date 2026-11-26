@@ -274,6 +274,16 @@ def _load_flow_checkpoint(models, path, kwargs):
         factory = getattr(models, config["name"])
         with torch.device("meta"):
             model = factory(**config["args"], **kwargs)
+        if factory.__module__ == "trellis2.models.structured_latent_flow":
+            from trellis2.modules.sparse.attention.rope import SparseRotaryPositionEmbedder
+
+            # The pinned upstream class stores this small deterministic tensor
+            # outside the checkpoint. Recreate it with the upstream constructor.
+            for module in model.modules():
+                if type(module) is SparseRotaryPositionEmbedder and module.freqs.is_meta:
+                    module.freqs = SparseRotaryPositionEmbedder(
+                        module.head_dim, module.dim, module.rope_freq,
+                    ).freqs
         expected = model.state_dict()
         tensors = load_file(weights_path, device="cpu")
         if tensors.keys() != expected.keys():
