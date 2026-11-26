@@ -20,6 +20,7 @@ from unittest.mock import patch
 TRELLIS2_SOURCE = "/opt/TRELLIS.2"
 TRELLIS2_REPO = "microsoft/TRELLIS.2-4B"
 TRELLIS2_REVISION = "af44b45f2e35a493886929c6d786e563ec68364d"
+RUNPOD_CACHED_MODELS = Path("/runpod-volume/huggingface-cache/hub")
 DINO_REPO = "facebook/dinov3-vitl16-pretrain-lvd1689m"
 DINO_REVISION = "ea8dc2863c51be0a264bab82070e3e8836b02d51"
 BIREFNET_REPO = "ZhengPeng7/BiRefNet"
@@ -64,52 +65,73 @@ def _patch_birefnet_config(path):
     path.write_text(source.replace(config_init, compatible_init, 1))
 
 
-def _stage_cached_weights(work_dir, weights):
-    """Read the pinned files sequentially into worker-local storage before mmap."""
+def _stage_cached_weights(work_dir, weights, hosted_weights):
+    """Use RunPod's exact main snapshot and stage the remaining volume files locally."""
     cache = Path(os.environ["HF_HUB_CACHE"])
     dino = Path(os.environ.get("CLAY_DINOV3_PATH") or _snapshot(cache, DINO_REPO, DINO_REVISION))
     birefnet = _snapshot(cache, BIREFNET_REPO, BIREFNET_REVISION)
     sparse = _snapshot(cache, SPARSE_REPO, SPARSE_REVISION)
     config = json.loads((weights / "pipeline.json").read_text())
     args = config["args"]
-    copies = []
+    copies, main_files = [], []
     for key, checkpoint in args["models"].items():
         if checkpoint == f"{SPARSE_REPO}/{SPARSE_CHECKPOINT}":
             source = sparse / SPARSE_CHECKPOINT
             args["models"][key] = SPARSE_CHECKPOINT
+            files = copies
         elif Path(checkpoint).parent == Path("ckpts"):
             source = weights / checkpoint
+            files = main_files
         else:
             raise RuntimeError(f"Unexpected TRELLIS.2 checkpoint: {checkpoint}")
-        copies.extend((Path(f"{source}{ext}"), work_dir / f"{args['models'][key]}{ext}")
+        files.extend((Path(f"{source}{ext}"), work_dir / f"{args['models'][key]}{ext}")
                       for ext in (".json", ".safetensors"))
     for repo, source, target in ((DINO_REPO, dino, "dinov3"), (BIREFNET_REPO, birefnet, "birefnet")):
         copies.extend((source / name, work_dir / target / name) for name in SNAPSHOT_FILES[repo])
-    total = 0
-    for source, _ in copies:
+    def size_checked(source):
         size = source.stat().st_size
         if size <= 0:
             raise RuntimeError(f"Missing checkpoint contents: {source.name}")
-        total += size
+        return size
+
+    links = [(hosted_weights / destination.relative_to(work_dir), source, destination)
+             for source, destination in main_files]
+    direct = bool(links) and hosted_weights.resolve() != weights.resolve() and all(
+        cached.is_file() and cached.stat().st_size == size_checked(source)
+        for cached, source, _ in links
+    )
+    cached_bytes = 0
+    if direct:
+        for cached, _, destination in links:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.symlink_to(cached.resolve())
+            cached_bytes += cached.stat().st_size
+    else:
+        copies.extend(main_files)
+
+    sizes = {source: size_checked(source) for source, _ in copies}
+    total = sum(sizes[source] for source, _ in copies)
     if shutil.disk_usage(work_dir).free < total + 2 * 1024**3:
         raise RuntimeError(f"Insufficient worker-local disk to stage {total / 1e9:.2f} GB of weights")
 
     def copy(entry):
         source, destination = entry
         destination.parent.mkdir(parents=True, exist_ok=True)
-        with _stage(f"copy {destination.relative_to(work_dir)} ({source.stat().st_size / 1e6:.1f} MB)"):
+        with _stage(f"copy {destination.relative_to(work_dir)} ({sizes[source] / 1e6:.1f} MB)"):
             shutil.copyfile(source, destination)
-            if destination.stat().st_size != source.stat().st_size:
+            if destination.stat().st_size != sizes[source]:
                 raise RuntimeError(f"Incomplete local checkpoint copy: {destination.name}")
 
     # Two large sequential reads keep the network mount busy without opening every shard at once.
     with ThreadPoolExecutor(max_workers=2) as pool:
-        list(pool.map(copy, sorted(copies, key=lambda item: item[0].stat().st_size, reverse=True)))
+        list(pool.map(copy, sorted(copies, key=lambda item: sizes[item[0]], reverse=True)))
     _patch_birefnet_config(work_dir / "birefnet" / "birefnet.py")
     args["image_cond_model"]["args"]["model_name"] = str(work_dir / "dinov3")
     args["rembg_model"]["args"]["model_name"] = str(work_dir / "birefnet")
     args["low_vram"] = True
     (work_dir / "pipeline.json").write_text(json.dumps(config))
+    return {"model_weights_source": "runpod_cached_model" if direct else "volume_copy",
+            "model_direct_bytes": cached_bytes, "model_staged_bytes": total}
 
 
 def require_pbr(mesh):
@@ -188,10 +210,10 @@ def _write_bake_source(path, vertices, faces):
 
 
 def _prepare_weights(work_dir):
+    cached = _snapshot(RUNPOD_CACHED_MODELS, TRELLIS2_REPO, TRELLIS2_REVISION)
     configured = os.environ.get("CLAY_TRELLIS2_WEIGHTS")
     if configured and os.environ.get("HF_HUB_CACHE"):
-        _stage_cached_weights(work_dir, Path(configured))
-        return
+        return _stage_cached_weights(work_dir, Path(configured), cached)
 
     from huggingface_hub import snapshot_download
     from huggingface_hub.errors import GatedRepoError
@@ -204,9 +226,8 @@ def _prepare_weights(work_dir):
         except GatedRepoError as error:
             raise RuntimeError("Hugging Face access to DINOv3 is required for TRELLIS.2.") from error
 
-    cached = Path(f"/runpod-volume/huggingface-cache/hub/models--microsoft--TRELLIS.2-4B/snapshots/{TRELLIS2_REVISION}")
-    weights = os.environ.get("CLAY_TRELLIS2_WEIGHTS")
-    if not weights:
+    weights = configured
+    if not configured:
         weights = cached if (cached / "pipeline.json").is_file() else snapshot_download(
             TRELLIS2_REPO, revision=TRELLIS2_REVISION, allow_patterns=["pipeline.json", "ckpts/*"]
         )
@@ -221,6 +242,8 @@ def _prepare_weights(work_dir):
     args["low_vram"] = True
     (work_dir / "pipeline.json").write_text(json.dumps(config))
     (work_dir / "ckpts").symlink_to(weights / "ckpts", target_is_directory=True)
+    source = "runpod_cached_model" if weights == cached.resolve() else "hugging_face"
+    return {"model_weights_source": "configured_path" if configured else source}
 
 
 @lru_cache(maxsize=1)
@@ -228,14 +251,19 @@ def _load_trellis2():
     from baseline_io import configure_process
     offline = bool(os.environ.get("CLAY_TRELLIS2_WEIGHTS") and os.environ.get("HF_HUB_CACHE"))
     configure_process(threads=min(8, len(os.sched_getaffinity(0))), offline=offline)
+    imported = time.perf_counter()
     with _stage("import model runtime"):
         from mesh_path import Trellis2MeshPath
+    imported = time.perf_counter() - imported
 
     work_dir = tempfile.TemporaryDirectory(prefix="clay-trellis2-", dir=os.environ.get("CLAY_MODEL_SCRATCH"))
     faulthandler.dump_traceback_later(90, repeat=True)
     try:
+        staged = time.perf_counter()
         with _stage("prepare weights"):
-            _prepare_weights(Path(work_dir.name))
+            weights_metrics = _prepare_weights(Path(work_dir.name))
+            print(f"Clay TRELLIS.2 weight preparation: {weights_metrics}", file=sys.stderr, flush=True)
+        staged = time.perf_counter() - staged
 
         disable = ["mesh_prep_worker_thread"]
         if os.environ.get("CLAY_TRELLIS2_STOCK_NATIVE") == "1":
@@ -264,6 +292,7 @@ def _load_trellis2():
             arm="mesh_path", disable=disable, source=TRELLIS2_SOURCE,
             weights=work_dir.name, record_latents=False, keep_models_on_gpu=False,
         )
+        initialized = time.perf_counter()
         with _stage("initialize model and GPU extensions"):
             from trellis2 import models
 
@@ -275,7 +304,12 @@ def _load_trellis2():
 
             with patch.object(models, "from_pretrained", load_timed):
                 method.load()
-        return method, work_dir
+        return method, work_dir, {
+            **weights_metrics,
+            "model_import_s": round(imported, 3),
+            "model_stage_s": round(staged, 3),
+            "model_init_s": round(time.perf_counter() - initialized, 3),
+        }
     except BaseException:
         work_dir.cleanup()
         raise
@@ -292,8 +326,9 @@ def _reference_image(encoded):
 
 
 def _trellis2_image(request, output):
+    model_cache_hit = _load_trellis2.cache_info().currsize > 0
     load_started = time.perf_counter()
-    method, _ = _load_trellis2()
+    method, _, initialization = _load_trellis2()
     load_s = time.perf_counter() - load_started
 
     import torch
@@ -323,10 +358,13 @@ def _trellis2_image(request, output):
     torch.cuda.synchronize()
     metrics = {
         "model_load_s": round(load_s, 3),
+        "model_cache_hit": model_cache_hit,
         "image_to_glb_s": round(time.perf_counter() - started, 3),
         "peak_allocated_mib": round(torch.cuda.max_memory_allocated() / 2**20, 1),
         "peak_reserved_mib": round(torch.cuda.max_memory_reserved() / 2**20, 1),
     }
+    if not model_cache_hit:
+        metrics.update(initialization)
     if views:
         metrics["reference_views"] = len(views)
     require_pbr(output.read_bytes())
