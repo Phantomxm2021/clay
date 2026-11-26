@@ -75,8 +75,12 @@ def handler(job):
         return {"format": "glb", "size_bytes": size, "bake_job_s": round(time.perf_counter()-started, 3)}
     except Exception as error:
         # HTTP errors can contain signed URLs. Keep only the exception class in logs.
-        LOGGER.error("Clay PBR bake failed during %s: %s", stage, type(error).__name__)
-        return {"error": "Clay PBR bake failed. Check the CPU worker logs."}
+        reason = type(error).__name__
+        if isinstance(error, httpx.HTTPStatusError):
+            reason = f"R2 HTTP {error.response.status_code}"
+        detail = f"Clay PBR bake failed during {stage} ({reason})."
+        LOGGER.error("%s", detail)
+        return {"error": detail}
 
 
 if __name__ == "__main__":
