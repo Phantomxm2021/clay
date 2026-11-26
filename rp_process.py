@@ -89,7 +89,7 @@ def _start_backend(backend):
     _backend_scratch = scratch
 
 
-def generate(backend, mode, *, image, prompt, target, seed):
+def generate(backend, mode, *, image, prompt, target, seed, pbr_bake=False):
     if _active_backend != backend or _active_process.poll() is not None:
         _start_backend(backend)
 
@@ -97,7 +97,8 @@ def generate(backend, mode, *, image, prompt, target, seed):
     # request parameters and completion metadata, separate from model logs.
     with tempfile.TemporaryDirectory(prefix="clay-inference-") as directory:
         output = Path(directory) / "model.glb"
-        request = dict(mode=mode, image=image, prompt=prompt, target=target, seed=seed, output=str(output))
+        request = dict(mode=mode, image=image, prompt=prompt, target=target, seed=seed, output=str(output),
+                       pbr_bake=pbr_bake)
         try:
             _active_process.stdin.write(json.dumps(request) + "\n")
             _active_process.stdin.flush()
@@ -110,7 +111,8 @@ def generate(backend, mode, *, image, prompt, target, seed):
             response = json.loads(line)
             if error := response.get("error"):
                 raise RuntimeError(error)
-            return output.read_bytes(), response["triangles"], response.get("metrics", {})
+            source = output.with_name("bake-source.glb").read_bytes() if pbr_bake else None
+            return output.read_bytes(), response["triangles"], response.get("metrics", {}), source
         except (OSError, ValueError, RuntimeError):
             stop_backend()
             raise

@@ -150,6 +150,43 @@ def require_pbr(mesh):
                 checked_images.add(source)
 
 
+def _write_bake_source(path, vertices, faces):
+    """Write Sprint3D's material-projection surface in the low GLB's frame."""
+    import numpy as np
+
+    vertices = np.asarray(vertices, dtype="<f4").copy(order="C")
+    faces = np.ascontiguousarray(faces, dtype="<u4")
+    if vertices.ndim != 2 or vertices.shape[1] != 3 or faces.ndim != 2 or faces.shape[1] != 3:
+        raise ValueError("Expected triangulated bake source geometry")
+    if not vertices.size or not faces.size or faces.max() >= len(vertices):
+        raise ValueError("Invalid bake source geometry")
+    # Same position conversion as sprint3d.mesh.bake.bake_and_finalize.
+    vertices[:, 1], vertices[:, 2] = vertices[:, 2].copy(), -vertices[:, 1]
+    binary_length = vertices.nbytes + faces.nbytes
+    doc = {
+        "asset": {"version": "2.0"}, "scene": 0, "scenes": [{"nodes": [0]}],
+        "nodes": [{"mesh": 0}], "meshes": [{"primitives": [{"attributes": {"POSITION": 0}, "indices": 1}]}],
+        "buffers": [{"byteLength": binary_length}],
+        "bufferViews": [
+            {"buffer": 0, "byteLength": vertices.nbytes, "target": 34962},
+            {"buffer": 0, "byteOffset": vertices.nbytes, "byteLength": faces.nbytes, "target": 34963},
+        ],
+        "accessors": [
+            {"bufferView": 0, "componentType": 5126, "count": len(vertices), "type": "VEC3",
+             "min": vertices.min(axis=0).tolist(), "max": vertices.max(axis=0).tolist()},
+            {"bufferView": 1, "componentType": 5125, "count": faces.size, "type": "SCALAR"},
+        ],
+    }
+    metadata = json.dumps(doc, separators=(",", ":"), allow_nan=False).encode()
+    metadata += b" " * (-len(metadata) % 4)
+    with path.open("wb") as file:
+        file.write(struct.pack("<4sIII4s", b"glTF", 2, 28 + len(metadata) + binary_length, len(metadata), b"JSON"))
+        file.write(metadata)
+        file.write(struct.pack("<I4s", binary_length, b"BIN\x00"))
+        file.write(memoryview(vertices).cast("B"))
+        file.write(memoryview(faces).cast("B"))
+
+
 def _prepare_weights(work_dir):
     configured = os.environ.get("CLAY_TRELLIS2_WEIGHTS")
     if configured and os.environ.get("HF_HUB_CACHE"):
@@ -205,6 +242,8 @@ def _load_trellis2():
             disable.extend(("fast_gpu_simplify", "gpu_bvh_build"))
 
         class ClayMeshPath(Trellis2MeshPath):
+            keep_pbr_source = False
+
             def _gpu_phase(self, mesh, resolution, divisor, timings):
                 from sprint3d.mesh import bake
 
@@ -213,6 +252,13 @@ def _load_trellis2():
                     mesh_module=self.mesh_module, bvh_cls=self.bvh_cls, remesh_divisor=divisor,
                     fast_simplify="fast_gpu_simplify" in self.levers, gpu_charts=True, timings=timings,
                 )
+
+            def _bake_and_write(self, stages, gpu_ctx, uv, attr_volume, coords, attr_layout, out_dir, stats):
+                super()._bake_and_write(stages, gpu_ctx, uv, attr_volume, coords, attr_layout, out_dir, stats)
+                if self.keep_pbr_source:
+                    with _stage("write PBR bake source"):
+                        _write_bake_source(out_dir / "bake-source.glb", gpu_ctx["vertices"].cpu().numpy(),
+                                           gpu_ctx["faces"].cpu().numpy())
 
         method = ClayMeshPath(
             arm="mesh_path", disable=disable, source=TRELLIS2_SOURCE,
@@ -249,6 +295,7 @@ def _trellis2_image(request, output):
     image.write_bytes(base64.b64decode(request["image"]))
     method.target_tris = request["target"]
     method.texture_size = int(os.environ.get("CLAY_TRELLIS2_TEXSIZE", "1024"))
+    method.keep_pbr_source = request.get("pbr_bake", False)
 
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()

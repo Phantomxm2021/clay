@@ -44,11 +44,11 @@ def _image_payload(value):
     return value
 
 
-def _upload_glb(mesh, bucket, endpoint_url, job_id):
+def _storage_client(endpoint_url):
     import boto3
     from botocore.config import Config
 
-    client = boto3.client(
+    return boto3.client(
         "s3",
         endpoint_url=endpoint_url,
         region_name=os.environ.get("AWS_DEFAULT_REGION") or "auto",
@@ -62,23 +62,37 @@ def _upload_glb(mesh, bucket, endpoint_url, job_id):
             response_checksum_validation="when_required",
         ),
     )
-    if isinstance(job_id, str) and job_id:
-        asset_id = uuid.uuid5(uuid.NAMESPACE_URL, f"clay-runpod:{job_id}").hex
-    else:
-        asset_id = uuid.uuid4().hex
-    object_key = f"clay/{asset_id}.glb"
-    client.put_object(
-        Bucket=bucket,
-        Key=object_key,
-        Body=mesh,
-        ContentType=GLB_CONTENT_TYPE,
-    )
-    glb_url = client.generate_presigned_url(
-        "get_object",
-        Params={"Bucket": bucket, "Key": object_key},
-        ExpiresIn=DOWNLOAD_URL_TTL,
-    )
-    return {"asset_id": asset_id, "object_key": object_key, "glb_url": glb_url}
+
+
+def _upload_glb(mesh, bucket, endpoint_url, job_id, source=None):
+    client = _storage_client(endpoint_url)
+    asset_uuid = uuid.uuid5(uuid.NAMESPACE_URL, f"clay-runpod:{job_id}") if job_id else uuid.uuid4()
+    object_key = f"clay/{asset_uuid.hex}.glb"
+
+    def signed(operation, key, **headers):
+        return client.generate_presigned_url(operation, Params={"Bucket": bucket, "Key": key, **headers},
+                                             ExpiresIn=DOWNLOAD_URL_TTL)
+
+    def put(key, body):
+        client.put_object(Bucket=bucket, Key=key, Body=body, ContentType=GLB_CONTENT_TYPE)
+
+    result = {"asset_id": asset_uuid.hex, "object_key": object_key}
+    if source is None:
+        put(object_key, mesh)
+        result["glb_url"] = signed("get_object", object_key)
+        return result
+
+    # Bake retries always read the original low mesh, including after a successful final PUT.
+    staging = f"clay/bake-inputs/{asset_uuid.hex}"
+    high_key, low_key = (f"{staging}/{name}.glb" for name in ("high", "low"))
+    put(high_key, source)
+    put(low_key, mesh)
+    result["pbr_bake"] = {
+        "high_url": signed("get_object", high_key), "low_url": signed("get_object", low_key),
+        "put_url": signed("put_object", object_key, ContentType=GLB_CONTENT_TYPE),
+        "glb_url": signed("get_object", object_key),
+    }
+    return result
 
 
 def handler(job):
@@ -93,6 +107,7 @@ def handler(job):
     target = inputs.get("target_tris", inputs.get("target_triangles", 30000))
     seed = inputs.get("seed", 42)
     output_format = inputs.get("output_format", "auto")
+    pbr_bake = inputs.get("pbr_bake", False)
     bucket = os.environ.get("CLAY_OUTPUT_BUCKET")
     upload = output_format == "url" or (output_format == "auto" and bool(bucket))
     endpoint_url = os.environ.get("CLAY_OUTPUT_ENDPOINT_URL")
@@ -108,6 +123,10 @@ def handler(job):
             raise ValueError("Object storage is missing bucket, endpoint, or credentials")
         if (image is None) == (prompt is None):
             raise ValueError("Provide either image_b64 or prompt")
+        if type(pbr_bake) is not bool:
+            raise ValueError("pbr_bake must be a boolean")
+        if pbr_bake and (image is None or not upload or os.environ.get("CLAY_IMAGE_BACKEND") != "sprint3d"):
+            raise ValueError("PBR baking needs TRELLIS.2 image generation with R2 storage")
         if type(target) is not int or not 1000 <= target <= 200000:
             raise ValueError("target_tris must be an integer from 1000 to 200000")
         if type(seed) is not int or not 0 <= seed < 2**32:
@@ -125,13 +144,16 @@ def handler(job):
     if mode == "text" and os.environ.get("CLAY_TRELLIS2_IMAGE_ONLY") == "1":
         return {"error": "This Clay endpoint accepts image requests"}
 
+    source = None
     if os.environ.get("CLAY_IMAGE_BACKEND") == "sprint3d":
         from rp_process import generate
 
         backend = "trellis2" if mode == "image" else "legacy"
-        mesh, triangles, metrics = generate(
-            backend, mode, image=image, prompt=prompt, target=target, seed=seed,
+        mesh, triangles, metrics, source = generate(
+            backend, mode, image=image, prompt=prompt, target=target, seed=seed, pbr_bake=pbr_bake,
         )
+        if pbr_bake and not source:
+            raise RuntimeError("Clay did not produce a PBR bake source")
     else:
         mesh, triangles = _generate_legacy(mode, image, prompt, target, seed)
         metrics = {}
@@ -151,7 +173,7 @@ def handler(job):
 
         try:
             started = time.perf_counter()
-            result.update(_upload_glb(mesh, bucket, endpoint_url, job.get("id")))
+            result.update(_upload_glb(mesh, bucket, endpoint_url, job.get("id"), source=source))
             if metrics:
                 metrics["r2_upload_s"] = round(time.perf_counter() - started, 3)
         except ClientError as exc:
