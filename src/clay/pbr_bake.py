@@ -179,6 +179,20 @@ def _append_tangents(doc, binary, primitive, with_positions):
     doc["accessors"].append({"bufferView": target, "componentType": 5126, "count": count, "type": "VEC4"})
 
 
+def _stabilize_baked_normals(normal):
+    # Projection onto a nearby opposing surface can put a sample below the
+    # delivery surface. Fall back to the delivery mesh's interpolated normal
+    # there, and taper near-grazing samples around rejected pixels. The glTF
+    # shader normalizes the sampled vector after decoding it.
+    weights = []
+    for blue in range(256):
+        z = blue / 127.5 - 1.0
+        confidence = max(0.0, min(1.0, (z - 0.25) / 0.4))
+        weights.append(round(255 * confidence**2 * (3 - 2 * confidence)))
+    neutral = Image.new("RGB", normal.size, (128, 128, 255))
+    return Image.composite(normal, neutral, normal.getchannel("B").point(weights))
+
+
 def combine_maps(low_glb, normal_png, ao_png, tangents=None):
     """Patch only the material and texture data for the queue's single-mesh export."""
     doc, binary = _read_glb(low_glb)
@@ -203,6 +217,7 @@ def combine_maps(low_glb, normal_png, ao_png, tangents=None):
         raise ValueError("All five material channels need the same UV atlas dimensions")
     if ao.getextrema()[1] == 0 or normal.getchannel("B").getextrema()[1] <= 128:
         raise ValueError("Blender produced an empty AO or tangent normal map")
+    normal = _stabilize_baked_normals(normal)
 
     orm = Image.merge("RGB", (ao, mr.getchannel("G"), mr.getchannel("B")))
     # Keep the old bytes and all of the existing binary offsets intact. Reuse

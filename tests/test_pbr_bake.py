@@ -68,6 +68,26 @@ def test_bake_rejects_maps_with_incompatible_atlas_dimensions():
         combine_maps(mesh, png("RGB", (128, 128, 255), size=(64, 64)), png("L", 255))
 
 
+def test_bake_rejects_backwards_normals_in_a_nonempty_map():
+    mesh = delivery_glb(png("RGB", (200, 0, 0)), png("RGB", (0, 180, 12)))
+    forward = (192, 128, 238)
+    grazing = (238, 128, 191)
+    backwards = (128, 128, 0)
+    normal_map = Image.new("RGB", (128, 128), forward)
+    normal_map.paste(backwards, (0, 0, 32, 128))
+    normal_map.paste(grazing, (32, 0, 64, 128))
+    normal = BytesIO()
+    normal_map.save(normal, "PNG")
+
+    doc, binary = _read_glb(combine_maps(mesh, normal.getvalue(), png("L", 255)))
+    encoded = _embedded_png(doc, binary, doc["materials"][0]["normalTexture"])[2]
+    with Image.open(BytesIO(encoded)) as baked_normal:
+        assert baked_normal.getpixel((8, 8)) == (128, 128, 255)
+        x, y, z = baked_normal.getpixel((40, 8))
+        assert 128 < x < grazing[0] and y == 128 and grazing[2] < z < 255
+        assert baked_normal.getpixel((80, 8)) == forward
+
+
 @pytest.mark.parametrize("normal, ao", [((128, 128, 128), 200), ((128, 128, 255), 0)])
 def test_bake_rejects_empty_maps(normal, ao):
     mesh = delivery_glb(png("RGB", (200, 0, 0)), png("RGB", (0, 180, 12)))
