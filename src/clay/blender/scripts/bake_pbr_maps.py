@@ -8,11 +8,13 @@ sys.path.insert(0, os.path.dirname(__file__))
 import bpy  # noqa: E402
 import numpy as np  # noqa: E402
 from _common import import_mesh, join_meshes, payload, reset, run  # noqa: E402
+from _normal_projection import bake_projected_normals  # noqa: E402
 
-def bake_image(node, path, size, kind):
-    image = bpy.data.images.new(kind, size, size, alpha=False, is_data=True)
+
+def bake_occlusion(node, path, size):
+    image = bpy.data.images.new("AO", size, size, alpha=False, is_data=True)
     node.image = image
-    bpy.ops.object.bake(type=kind, normal_space="TANGENT")
+    bpy.ops.object.bake(type="EMIT")
     image.filepath_raw = path
     image.file_format = "PNG"
     image.save()
@@ -48,7 +50,6 @@ def main():
 
     import_mesh(args["high"])
     high = join_meshes()
-    bpy.ops.object.shade_smooth()
     import_mesh(args["low"])
     low, = [obj for obj in bpy.context.selected_objects if obj.type == "MESH" and obj != high]
     if low.data.uv_layers.active is None:
@@ -56,13 +57,18 @@ def main():
     scale = low.dimensions.length
     if scale <= 0:
         raise ValueError("The delivery mesh has zero extent")
+    bake = scene.render.bake
+    bake.margin = 8
+    bake_projected_normals(high, low, args["resolution"], bake.margin, args["normal_map"])
     if args.get("tangents"):
         write_tangents(low.data, args["tangents"])
 
+    # Bake AO on the delivery surface itself. A second, nearly coincident mesh
+    # in the AO scene would introduce false self-shadowing.
+    bpy.data.objects.remove(high, do_unlink=True)
     for obj in bpy.context.selected_objects:
         obj.select_set(False)
     low.select_set(True)
-    high.select_set(True)
     bpy.context.view_layer.objects.active = low
     # Only the scratch material changes. The delivery GLB is patched outside Blender.
     low.data.materials.clear()
@@ -72,18 +78,8 @@ def main():
     node = material.node_tree.nodes.new("ShaderNodeTexImage")
     material.node_tree.nodes.active = node
 
-    bake = scene.render.bake
-    bake.margin = 8
-    bake.use_selected_to_active = True
-    bake.cage_extrusion = scale * 0.01
-    bake.max_ray_distance = scale * 0.03
-    scene.cycles.samples = 8
-    bake_image(node, args["normal_map"], args["resolution"], "NORMAL")
-
-    # Bake AO on the delivery surface itself. A second, nearly coincident mesh
-    # in the AO scene would introduce false self-shadowing.
-    bpy.data.objects.remove(high, do_unlink=True)
     bake.use_selected_to_active = False
+    scene.cycles.samples = 8
     tree = material.node_tree
     occlusion = tree.nodes.new("ShaderNodeAmbientOcclusion")
     occlusion.only_local = True
@@ -97,7 +93,7 @@ def main():
     tree.links.new(emission.outputs[0], tree.nodes.get("Material Output").inputs["Surface"])
     tree.nodes.active = node
     # A bounded hemisphere bake preserves exposed surfaces and darkens nearby concavities.
-    bake_image(node, args["ao_map"], args["resolution"], "EMIT")
+    bake_occlusion(node, args["ao_map"], args["resolution"])
     return {"ok": True}
 
 

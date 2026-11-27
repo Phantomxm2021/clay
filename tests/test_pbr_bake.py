@@ -1,10 +1,14 @@
-from io import BytesIO
 import struct
+import subprocess
+from io import BytesIO
+from pathlib import Path
 
 import pytest
 
 Image = pytest.importorskip("PIL.Image")
+ImageChops = pytest.importorskip("PIL.ImageChops")
 
+from clay.blender.engine import resolve_blender  # noqa: E402
 from clay.pbr_bake import (  # noqa: E402
     _append_view, _embedded_png, _read_glb, _repair_vertex_frames, _write_glb, combine_maps,
 )
@@ -70,22 +74,64 @@ def test_bake_rejects_maps_with_incompatible_atlas_dimensions():
 
 def test_bake_rejects_backwards_normals_in_a_nonempty_map():
     mesh = delivery_glb(png("RGB", (200, 0, 0)), png("RGB", (0, 180, 12)))
-    forward = (192, 128, 238)
-    grazing = (238, 128, 191)
-    backwards = (128, 128, 0)
-    normal_map = Image.new("RGB", (128, 128), forward)
-    normal_map.paste(backwards, (0, 0, 32, 128))
-    normal_map.paste(grazing, (32, 0, 64, 128))
+    normal_map = Image.new("RGB", (128, 128), (192, 128, 238))
+    normal_map.putpixel((0, 0), (128, 128, 0))
     normal = BytesIO()
     normal_map.save(normal, "PNG")
+    with pytest.raises(ValueError, match="backwards tangent normal"):
+        combine_maps(mesh, normal.getvalue(), png("L", 255))
 
-    doc, binary = _read_glb(combine_maps(mesh, normal.getvalue(), png("L", 255)))
-    encoded = _embedded_png(doc, binary, doc["materials"][0]["normalTexture"])[2]
-    with Image.open(BytesIO(encoded)) as baked_normal:
-        assert baked_normal.getpixel((8, 8)) == (128, 128, 255)
-        x, y, z = baked_normal.getpixel((40, 8))
-        assert 128 < x < grazing[0] and y == 128 and grazing[2] < z < 255
-        assert baked_normal.getpixel((80, 8)) == forward
+
+@pytest.mark.skipif(not resolve_blender(), reason="Blender not available")
+def test_two_sided_normal_bake_is_independent_of_source_winding(tmp_path):
+    script_dir = Path(__file__).resolve().parents[1] / "src/clay/blender/scripts"
+    scene = tmp_path / "normal_projection.py"
+    scene.write_text("""
+from pathlib import Path
+import sys
+
+import bpy
+
+scripts, output = sys.argv[-2:]
+sys.path.insert(0, scripts)
+from _normal_projection import bake_projected_normals
+
+def mesh(name, vertices, faces):
+    data = bpy.data.meshes.new(name)
+    data.from_pydata(vertices, [], faces)
+    data.update()
+    obj = bpy.data.objects.new(name, data)
+    bpy.context.collection.objects.link(obj)
+    return obj
+
+# One sloped reference sheet corresponds to opposite sides of a thin shell.
+points = [(-1, -1, -.03), (1, -1, .03), (1, 1, .03), (-1, 1, -.03)]
+front = [(0, 1, 2), (0, 2, 3)]
+source = mesh("source", points, front)
+flipped = mesh("flipped", points, [face[::-1] for face in front])
+shell = [(x, y, z) for z in (.003, -.003) for x, y, _ in points]
+low = mesh("shell", shell, front + [(6, 5, 4), (7, 6, 4)])
+uv = low.data.uv_layers.new()
+coords = [(.05, .05), (.45, .05), (.45, .95), (.05, .95)]
+for loop in low.data.loops:
+    u, v = coords[loop.vertex_index % 4]
+    uv.uv[loop.index].vector = (u + .5 * (loop.vertex_index // 4), v)
+low.data.update()
+for obj in (source, flipped):
+    path = Path(output) / f"{obj.name}.png"
+    bake_projected_normals(obj, low, 128, 8, str(path))
+""", encoding="utf-8")
+    proc = subprocess.run(
+        [resolve_blender(), "-b", "--factory-startup", "--python-exit-code", "1",
+         "--python", str(scene), "--", str(script_dir), str(tmp_path)],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    with Image.open(tmp_path / "source.png") as first, Image.open(tmp_path / "flipped.png") as second:
+        assert all(high <= 1 for _, high in ImageChops.difference(first, second).getextrema())
+        assert first.getchannel("B").getextrema()[0] >= 128
+        assert first.getpixel((32, 64))[0] < 127
+        assert first.getpixel((96, 64))[0] > 129
 
 
 @pytest.mark.parametrize("normal, ao", [((128, 128, 128), 200), ((128, 128, 255), 0)])
