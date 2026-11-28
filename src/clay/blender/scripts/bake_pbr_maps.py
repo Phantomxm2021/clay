@@ -41,6 +41,35 @@ def write_tangents(mesh, path):
     data.astype("<f4", copy=False).tofile(path)
 
 
+def rebuild_vertex_normals(low, path):
+    mesh = low.data
+    previous = np.empty((len(mesh.corner_normals), 3), dtype=np.float32)
+    mesh.corner_normals.foreach_get("vector", previous.ravel())
+    bpy.context.view_layer.objects.active = low
+    if mesh.has_custom_normals:
+        bpy.ops.mesh.customdata_custom_splitnormals_clear()
+    mesh.polygons.foreach_set("use_smooth", np.ones(len(mesh.polygons), dtype=bool))
+    mesh.update()
+    current = np.empty_like(previous)
+    mesh.corner_normals.foreach_get("vector", current.ravel())
+    normals = np.empty((len(mesh.vertices), 3), dtype=np.float32)
+    mesh.vertex_normals.foreach_get("vector", normals.ravel())
+    vertices = np.empty(len(mesh.loops), dtype=np.int32)
+    mesh.loops.foreach_get("vertex_index", vertices)
+    if not np.allclose(current, normals[vertices], atol=1e-5):
+        raise ValueError("The delivery mesh needs split vertices for its shading normals")
+    areas = np.empty(len(mesh.polygons), dtype=np.float32)
+    mesh.polygons.foreach_get("area", areas)
+    if not np.isfinite(areas).all() or not np.any(areas > 0):
+        raise ValueError("The delivery mesh has no finite nondegenerate faces")
+    normals[:, [1, 2]] = normals[:, [2, 1]] * (1, -1)
+    normals.astype("<f4", copy=False).tofile(path)
+    return {
+        "degenerate_faces": int((areas <= 0).sum()),
+        "reversed_shading_corners": int((np.sum(previous * current, axis=1) < 0).sum()),
+    }
+
+
 def main():
     args = payload()
     reset()
@@ -57,6 +86,7 @@ def main():
     scale = low.dimensions.length
     if scale <= 0:
         raise ValueError("The delivery mesh has zero extent")
+    quality = rebuild_vertex_normals(low, args["vertex_normals"])
     bake = scene.render.bake
     bake.margin = 8
     bake_projected_normals(high, low, args["resolution"], bake.margin, args["normal_map"])
@@ -94,7 +124,7 @@ def main():
     tree.nodes.active = node
     # A bounded hemisphere bake preserves exposed surfaces and darkens nearby concavities.
     bake_occlusion(node, args["ao_map"], args["resolution"])
-    return {"ok": True}
+    return {"ok": True, "quality": quality}
 
 
 run(main)

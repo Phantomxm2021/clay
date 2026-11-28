@@ -32,7 +32,8 @@ def _urls(inputs):
     if not name:
         raise ValueError("Invalid Clay bake input path")
     prefix, asset = name.groups()
-    if low.path != f"{prefix}/bake-inputs/{asset}/low.glb" or output.path != f"{prefix}/{asset}.glb":
+    version = rf"{re.escape(prefix)}/{asset}(?:-rebake-[a-f0-9]{{32}})?\.glb"
+    if low.path != f"{prefix}/bake-inputs/{asset}/low.glb" or not re.fullmatch(version, output.path):
         raise ValueError("Bake URLs must address the same Clay asset")
     return urls
 
@@ -64,7 +65,7 @@ def handler(job):
             stage = "download low mesh"
             _download(client, low_url, low, MAX_LOW_BYTES)
             stage = "bake Normal and AO"
-            bake_pbr(high, low, output)
+            quality = bake_pbr(high, low, output)
             size = output.stat().st_size
             if size > MAX_LOW_BYTES:
                 raise ValueError("Baked GLB exceeds the delivery size limit")
@@ -72,7 +73,8 @@ def handler(job):
             with output.open("rb") as file:
                 client.put(put_url, content=file, headers={"Content-Type": GLB_CONTENT_TYPE,
                                                           "Content-Length": str(size)}).raise_for_status()
-        return {"format": "glb", "size_bytes": size, "bake_job_s": round(time.perf_counter()-started, 3)}
+        return {"format": "glb", "size_bytes": size, "quality": quality,
+                "bake_job_s": round(time.perf_counter()-started, 3)}
     except Exception as error:
         # HTTP errors can contain signed URLs. Keep only the exception class in logs.
         reason = type(error).__name__

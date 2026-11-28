@@ -173,14 +173,19 @@ def _append_tangents(doc, binary, primitive, with_positions):
             raise ValueError("Blender changed the delivery vertex order or frame")
         normal = struct.unpack_from("<3f", binary, normal_offset + index * normal_stride)
         tangents.extend(struct.pack("<4f", *_tangent_frame((tx, ty, tz), sign, normal)))
+    if "TANGENT" in attributes:
+        start, step, _ = _accessor_layout(doc, attributes["TANGENT"], 16)
+        for index, frame in enumerate(struct.iter_unpack("<4f", tangents)):
+            struct.pack_into("<4f", binary, start + index * step, *frame)
+        return
     target = _append_view(doc, binary, tangents)
     doc["bufferViews"][target]["target"] = 34962
     attributes["TANGENT"] = len(doc["accessors"])
     doc["accessors"].append({"bufferView": target, "componentType": 5126, "count": count, "type": "VEC4"})
 
 
-def combine_maps(low_glb, normal_png, ao_png, tangents=None):
-    """Patch only the material and texture data for the queue's single-mesh export."""
+def combine_maps(low_glb, normal_png, ao_png, tangents=None, vertex_normals=None):
+    """Package the baking frame and textures without changing mesh topology or UVs."""
     doc, binary = _read_glb(low_glb)
     primitives = [primitive for mesh in doc["meshes"] for primitive in mesh["primitives"]]
     if len(primitives) != 1 or not {"NORMAL", "TEXCOORD_0"} <= primitives[0]["attributes"].keys():
@@ -226,7 +231,26 @@ def combine_maps(low_glb, normal_png, ao_png, tangents=None):
     material["occlusionTexture"] = {"index": mr_info["index"]}
     doc["textures"].append(normal_texture)
     doc["images"].append({"bufferView": normal_view, "mimeType": PNG, "name": "Normal"})
-    if tangents is not None and "TANGENT" not in primitives[0]["attributes"]:
+    if vertex_normals is not None:
+        if tangents is None:
+            raise ValueError("The rebuilt shading frame needs matching tangents")
+        normal_index = primitives[0]["attributes"]["NORMAL"]
+        start, step, count = _accessor_layout(doc, normal_index, 12)
+        if len(vertex_normals) != count * 12:
+            raise ValueError("Cannot match rebuilt normals to the delivery GLB vertices")
+        for index, vector in enumerate(struct.iter_unpack("<3f", vertex_normals)):
+            if unit := _unit(vector):
+                struct.pack_into("<3f", binary, start + index * step, *unit)
+        # NORMAL and TANGENT bounds are optional. The existing extrema may
+        # describe the old shading frame.
+        attributes = primitives[0]["attributes"]
+        for name in ("NORMAL", "TANGENT"):
+            if name in attributes:
+                accessor = doc["accessors"][attributes[name]]
+                accessor.pop("min", None)
+                accessor.pop("max", None)
+    if tangents is not None and (vertex_normals is not None
+                                or "TANGENT" not in primitives[0]["attributes"]):
         _append_tangents(doc, binary, primitives[0], tangents)
     return _write_glb(doc, binary)
 
@@ -255,18 +279,21 @@ def bake_pbr(high, low, output, *, blender=None):
             low = directory / "repaired-low.glb"
             low.write_bytes(low_glb)
         normal, ao = directory / "normal.png", directory / "ao.png"
-        tangents = directory / "tangents.bin" if "TANGENT" not in primitive["attributes"] else None
+        tangents = directory / "tangents.bin"
+        vertex_normals = directory / "vertex-normals.bin"
         result = run_script("bake_pbr_maps.py", {
             "high": str(high), "low": str(low), "resolution": width,
             "normal_map": str(normal), "ao_map": str(ao),
-            "tangents": str(tangents) if tangents else None,
+            "tangents": str(tangents),
+            "vertex_normals": str(vertex_normals),
         }, blender=blender, timeout=600)
         if not result.get("ok"):
             raise RuntimeError("Blender did not complete the PBR bake")
         staged = directory / "model.glb"
         staged.write_bytes(combine_maps(low_glb, normal.read_bytes(), ao.read_bytes(),
-                                       tangents.read_bytes() if tangents else None))
+                                       tangents.read_bytes(), vertex_normals.read_bytes()))
         staged.replace(output)
+        return result.get("quality", {})
 
 
 def main():
